@@ -16,7 +16,19 @@ from .service import AllocationService, allocate_preview
 from .store import (ItemConflict, ItemImportReport, RuleImportReport,
                     RuleRejected, import_items, import_rules)
 
+
+from .protection import (AUDIT_FORMAT, PUBLIC_FORMAT, Cell, NotPublishable,
+                         Policy, SearchResult, Table, build_audit, build_table,
+                         export_public, hidden_witnesses, plan, protected,
+                         publish, solve_suppression, table_digest,
+                         validate_policy, write_json_report)
+from . import reportcheck
+
 __all__ = [
+    "AUDIT_FORMAT", "PUBLIC_FORMAT", "Cell", "NotPublishable", "Policy",
+    "SearchResult", "Table", "build_audit", "build_table", "export_public",
+    "hidden_witnesses", "plan", "protected", "publish", "solve_suppression",
+    "table_digest", "validate_policy", "write_json_report", "reportcheck",
     "AllocationService", "allocate_preview", "ComputeResult", "ItemAllocation",
     "TerminalAllocation", "largest_remainder", "run_allocation",
     "Explanation", "Issue", "Propagation", "RuleGraph", "explain_terminal",

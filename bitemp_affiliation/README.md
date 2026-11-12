@@ -172,3 +172,92 @@ WHERE researcher_id = ?
 （含恰等于），覆盖所有临界情形。验收测试含：嵌套重叠、跨时区等价时刻、无穷尾
 区间、晚到的替代链、同分决胜、循环替代被拒、区间端点不重复归属、更正后仅列出
 真正受影响的事实、整批拒绝原子性、幂等重放、空档保持未知、随机多批对拍。
+
+## 报表主次抑制（`bitemp.alloc.protection`）
+
+科研联盟公开月度经费表时，人数少的格子必须隐藏（主抑制）；但只藏这些格子不够：
+只要同一行/列还剩可算的格，读者就能用行/列合计反推出隐藏金额。因此还要额外隐藏
+正常格子（次抑制），直到**整张表**的线性方程无法唯一确定任何隐藏金额。
+
+### 表口径
+
+| 规则 | 实现 |
+|---|---|
+| 行 = 月份（事项日期的 `%Y-%m`），列 = 末级机构 | `build_table` |
+| 格 = 该已存批次的整数末端金额之和 | `monthly_rollup` + `alloc_run_leaf` |
+| 只建模确有份额记录的格子；未出现组合 = 公开已知的结构零 | 表中不出现；公开物也不出现 |
+| 同研究者同格多笔非零份额只算一个贡献人 | `_contributors` 用 `GROUP BY (月, 人, 末级)` |
+| 正负冲回使金额为 0，但非零份额记录仍在 -> 人数仍计入 | 同上 |
+| 找不到归属的事项单列汇总，不入表 | `unresolved_detail`，审计件里单列 |
+
+### 保护判据（整张表一起看）
+
+隐藏金额为可正可负的未知整数；已发布约束是行合计、列合计与每个可见格子的精确
+金额。把可见值代入后，剩余条件只是“每行、每列的带符号隐藏格之和为 0”。以行/
+列为二部图两侧、隐藏格为边，得到隐藏子图 **H**：
+
+> **H 中每个隐藏金额都不能被唯一确定 ⇔ H 的每条边都在某个环上 ⇔ H 没有桥。**
+
+桥会把 H 切成两侧，两侧各自必须收支平衡，从而桥的金额被唯一钉死。两个不相连的
+矩形块各自安全，但用一条额外隐藏的桥连起来时，桥本身就会被全表方程解出——所以
+“每行每列至少藏两个”的局部检查不充分（`tests_disclosure.py` 有反例）。
+本判据等价于对剩余方程做有理数消元求每个未知量的自由度。
+
+### 策略与求解
+
+```python
+Policy(min_contributors=k,           # 贡献人数 < k -> 主抑制（必须隐藏）
+       costs={("2024-01","A"): 5},   # 每格额外隐藏成本（非负整数），缺省 default_cost
+       default_cost=1,
+       must_publish={("2024-02","C")},  # 必须公开；与主抑制冲突或切断所有方案 -> 拒绝
+       max_candidates=18)            # 显式搜索规模上限；超出 -> incomplete，不宣称最优
+```
+
+* 目标按序：**总成本最小 → 额外隐藏数量最少 → 排序后的 (月份, 机构) 列表字典序最小**。
+* 求解为精确最优优先搜索：目标键对“多选一格”严格单调，正好弹出第一个可行掩码
+  即全局最优；结果确定，不依赖堆内同键顺序。
+* 候选数超过 `max_candidates` 时返回 `status="incomplete"`（`verified=False`），
+  任何导出都会拒绝。默认上限 18，验收测试覆盖 18 候选的真实精确求解与全枚举对拍。
+* 主抑制被强制公开、或强制公开切断所有补环方案时，抛出 `NotPublishable`，
+  不生成看似合格的报表。
+
+### 两个出口
+
+```python
+from bitemp.alloc.protection import plan, publish, Policy
+table, search = plan(con, run_id, Policy(min_contributors=2))
+public, audit = publish(con, run_id, Policy(min_contributors=2))
+```
+
+* **公开件**（`format=alloc-disclosure/public/v1`）：只有 `rows`（每格的
+  `{"amount": n}` 或 `"hidden"` 占位、`row_total`）、`col_totals` 与自校验
+  `report_id`。不含隐藏金额、贡献人数、研究者标识、批次绑定或任何可还原明细。
+* **审计件**（`format=alloc-disclosure/audit/v1`）：输入批次绑定（run/version/asof）、
+  策略摘要、主/次抑制集合、目标值、整表 ledger，以及**每个隐藏格一条可机检的
+  非零整数扰动见证**（环上 ±1 赋值，逐节点带符号和为 0）。
+
+### 独立复核器（`bitemp.alloc.reportcheck`）
+
+不调用求解器实现：
+
+```python
+reportcheck.check_free_columns(table, hidden)   # 有理数 Gauss-Jordan：每个隐藏量的自由度
+reportcheck.is_protected_by_algebra(table, hidden)
+reportcheck.enumerate_small(table, policy)      # 小表枚举全部合法额外隐藏集合
+reportcheck.check_witnesses(table, hidden, witnesses)
+reportcheck.verify_artifacts(table, public, audit)   # 结构 + 合计 + 泄露 + 见证
+```
+
+`enumerate_small` 用复核器自带的独立桥检测枚举 2^n 个掩码，最优解再由有理数消元
+确认；`check_witnesses` 逐条核对环扰动。
+
+### 运行
+
+```bash
+python3 main_disclosure.py demo    # 8 个可手算场景 + 公开/审计双出口
+python3 tests_disclosure.py        # 30 项验收测试
+```
+
+演示覆盖：单独藏小群体格被行合计反推；补矩形环解除；两块环 + 桥时桥被钉住；
+强制公开切断方案时拒绝；多人多笔与正负抵消的人数去重；同成本方案字典序决胜；
+超上限返回 incomplete；更换最新路由后同一已存批次导出不变。
