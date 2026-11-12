@@ -31,11 +31,101 @@ bitemp/
   queries.py   effective_at × known_at 联合查询
   verify.py    独立 oracle：逐时点直接解释原始断言，对拍维表
   datagen.py   可复现的随机数据生成器（含无效批生成器）
+  alloc/       分摊管线（见下节）
 main.py        装配入口：demo / verify
-tests_acceptance.py  14 项验收测试
+main_alloc.py  分摊管线入口：demo / crystal（金标准）
+tests_acceptance.py  14 项验收测试（双时态维表）
+tests_alloc.py       29 项验收测试（分摊管线）
 ```
 
-## 运行
+## 分摊管线（`bitemp.alloc`）
+
+机构联盟编制科研经费统计时，一笔贡献会沿 `院系 -> 校区 -> 联合中心` 逐级分配，
+组织结构还按日期调整。本模块把每笔事项按**末级报送单元**的精确份额拆成整数最小
+货币单位，并留下可审计路由。它复用已交付的双时态维表：起点机构由
+`queries.org_at(person_key, day, asof)` 解析，不重复实现归属装配器。
+
+### 输入
+
+两类 JSONL（每行一个对象；`read_jsonl` / `write_jsonl` 见 `alloc/io.py`）：
+
+```text
+事项  {"item_key","person_key","day","amount"}        amount 为整数最小货币单位，可负
+路由  {"edge_key","src","dst","begin","until","numerator","denominator"}
+```
+
+`[begin, until)` 左闭右开，`until` 缺省（`null`/空）= +∞。每条出边携带一个非负有理数
+份额 `numerator/denominator`。
+
+### 语义与不变量
+
+| 规则 | 实现 |
+|---|---|
+| 起点机构 | `bitemp.queries.org_at` 在给定 `asof` 下解析；解析不到 -> unresolved 明细，不丢弃 |
+| 末级单元 | 在某活跃日期段内无活跃出边的节点（同一节点可在不同段分别是中间节点与末级） |
+| 中间节点守恒 | 任一活跃日期的出边份额之和必须恰为 1（精确 `Fraction`） |
+| 同 src/dst 多边 | 不同阶段可各用不同边；活跃期重叠视为重复配置并拒收 |
+| 环 | 按边界切出的**每个日期段**分别检测，段内环拒收 |
+| 仅跨期假环 | 反向边生效日完全错开时，合看有环、逐段无环 -> 允许 |
+| 精确计算 | 全程 `Fraction`，只在末端一次性取整；无浮点中间量 |
+| 取整 | 金额先取绝对值，按最大余数法分配整数单位；余数相同按末级标识升序；负金额反号 |
+| 守恒 | 每笔事项末级金额之和严格等于原金额 |
+| 多路汇合 | 拓扑 DP `forward[v] += forward[u]*w`，权重在汇合点相加；O(V+E)，不枚举路径 |
+| 校验 | 边界切段、逐段校验环/守恒/负分母/悬空标识/重复配置，返回具体问题边 + 可复现日期 |
+| 事务 | 规则整份导入一个事务；拒收时无半成品，上一版可用规则保留 |
+| 固定摘要 | 摘要只由规范化边集合决定；等价集合（顺序/约分/排版不同）返回原版本 |
+| 结果绑定 | run 绑定 `version_id + asof`；后续改规则不影响已存结果 |
+| 事项幂等 | 同 `item_key` 同内容不重复累计；不同内容整批报冲突 |
+| 汇总 | 按 (月份, 末级单元) 合计；unresolved 单列数量与金额 |
+
+### 入口
+
+```python
+from bitemp.alloc import AllocationService, read_jsonl
+
+svc = AllocationService(con)                       # con 为 bitemp.schema.connect(...)
+svc.load_rules(read_jsonl("edges.jsonl"))          # 事务性装载，幂等
+svc.load_items(read_jsonl("items.jsonl"))          # 幂等，冲突报错
+trial = svc.trial(asof, day_range=(lo, hi))        # 试算，不落库
+run_id = svc.compute(asof, day_range=(lo, hi))     # 正式计算，落库并绑定版本
+svc.monthly_rollup(run_id)                         # [(月份, 末级单元, 合计, 笔数)]
+svc.unresolved(run_id)                             # {count, amount, items}
+svc.explain_text(run_id, "IT-001")                 # 精确权重 + 每条参与边的金额归因
+```
+
+`explain` 从落库的 run + 绑定版本重建图并做反向 DP，因此从磁盘重开数据库后
+解释结果保持一致。`explain(...)["edge_amounts"]` 给出每条实际参与边的精确
+金额归因（流量权重 × 金额，未取整）。
+
+### 目录（`bitemp/alloc/`）
+
+```
+model.py     事项/边模型、精确分数、规范化与固定摘要
+graph.py     边界切段、逐段校验、拓扑 DP、反向解释
+allocate.py  起点解析 -> 传播 -> 最大余数法取整 -> 归因
+store.py     DuckDB 表、规则/事项事务导入、结果落库
+queries.py   月度合计、unresolved 明细、从磁盘解释
+service.py   高层入口：装载/试算/计算/解释
+goldens.py   金标准场景 + 逐路径独立 oracle
+diamond.py   30 层菱形生成器、随机无环网络生成器
+io.py        JSONL 读写
+```
+
+### 运行
+
+```bash
+python3 tests_alloc.py               # 分摊管线验收测试（29 项）
+python3 main_alloc.py crystal        # 金标准（人工可手算）
+python3 main_alloc.py demo           # 装载 -> 试算 -> 计算 -> 汇总 -> 解释 -> 拒收旧版继续
+python3 main_alloc.py demo --db demo.duckdb   # 附磁盘重开解释一致性
+```
+
+金标准覆盖：两支到同一末端、三等分一分钱、负数冲回、机构跨日换出口、
+同时有效的环（拒收）、仅跨期组合的假环（放行）、多路汇合相加。
+另有独立逐路径小图对拍、随机无环网络守恒检查，以及 30 层菱形
+（2^30 条路径、60 余节点）按拓扑 DP 不展开路径的端到端核验。
+
+## 运行（双时态维表）
 
 ```bash
 pip install duckdb pytz
