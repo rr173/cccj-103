@@ -1,8 +1,147 @@
 # 科研数据工具集（Python + DuckDB）
 
-本仓库包含三项能力：**研究机构组织归属双时态维表**（`bitemp`）、
+本仓库包含四项能力：**研究机构组织归属双时态维表**（`bitemp`）、
 **经费分摊管线**（`bitemp.alloc`，含报表主次抑制）、
-**测量数据处理与一阶不确定度传播**（`bitemp.metrology`，新增）。
+**测量数据处理与一阶不确定度传播**（`bitemp.metrology`）、
+**双端 FASTQ 读段整理管线**（`bitemp.pefastq`，新增）。
+
+## 双端 FASTQ 读段整理管线（`bitemp.pefastq`）
+
+测序平台交来的双端 FASTQ 常被拆成多个分片：R1 是片段的一端，R2 是另一端。
+分片内排列不保证一致，还会缺端、重传，甚至出现同名不同内容的读段。本管线
+从一份清单出发，把全部源暂存进 DuckDB，**读完所有分片之后才决定每个
+（样本, 读段名）键的去向**，最后为每个样本导出两个按名字 UTF-8 字节序、
+逐条严格对应的 FASTQ，供后续序列分析直接消费。配对决策与导出都在有界
+批量内完成（外存组织，不使用随输入增长的 Python 字典），输出顺序不取决
+于分片排列与到达顺序。
+
+### 清单（CSV）
+
+```text
+source_id,sample,mate,path
+d1,DEMO1,1,shards/d1_r1.fq
+d2,DEMO1,1,shards/d2_r1.fq.gz
+d3,DEMO1,2,shards/d3_r2.fq
+```
+
+- `source_id` 全清单不可重复；`mate` 为 1 或 2（该源所有记录应为同一端）；
+- 一个样本的同一端可以来自多个分片（多行同 sample 同 mate）；
+- `path` 指向普通 FASTQ 或 `.gz`；相对路径按**清单所在位置**解析；
+- `sample` 用于输出文件名，不得含路径分隔符与控制字符。
+
+### 记录与头部约定
+
+- 每条记录恰好四个物理行（`@头` / 序列 / `+行` / 质量串），**不支持折行**；
+  解析按固定四行分块，绝不通过"搜索下一个 `@`"猜测记录边界——质量串本身
+  可以以 `@` 或 `+` 开头，只有四行分块是可靠的。
+- 序列只接受 A/C/G/T/N（大小写统一为大写），非空；质量为 Phred+33
+  （ASCII 33..74），与序列等长。`+` 行若重复头信息，必须与 `@` 后文本一致。
+- 支持的头部（`@` 之后）：`NAME`、`NAME/1`、`NAME/2`、
+  `NAME 1:N:0:INDEX`（空白后首 token 以 `1:`/`2:` 开头的 Casava 风格）、
+  两种标记同时出现。规范化读段名 = 空白前第一个 token 去掉末尾至多一个
+  `/1` 或 `/2`。**配对键 = (样本, 读段名)，不跨样本串配**；原始头部完整
+  保留在库中（`records.header`，`where` 入口可见）。
+- 头部端标记（`/1`、`/2` 后缀与注释首 token）必须与清单 mate 一致；
+  两处标记互相矛盾也算非法记录；无端标记时以清单为准。
+- 记录错误可指回 `source_id`、记录序号（源内 1 起）与起始物理行号
+  （见 `rejected.csv` 与 `where`）。
+
+### 每个键的终态（恰好一种，判定优先级如下）
+
+| 终态 | 含义 |
+|---|---|
+| `rejected` | 键内存在能确定名字的非法记录（另一端不当孤端输出） |
+| `conflict` | 同一端出现内容不同的记录——哪怕清洗后会变成一样也不合并 |
+| `filtered` | 两端唯一合法，但 3' 端清洗后任一端短于最短保留长度 |
+| `paired`   | 两端唯一合法且通过清洗，进入合格 FASTQ |
+| `orphan`   | 只有一端且没有其他错误 |
+
+同一端反复出现且规范化后的完整序列与质量串都相同时**合并成一条**（保留
+每个来源，见 `duplicates.csv`）。清洗只从每端 3' 末尾连续删除质量低于
+阈值的碱基，遇到合格碱基即停止，不改中间的低质量位置；任一端清洗后短于
+最短保留长度则整对进入 `filtered`，另一端不混入合格输出。后到的冲突不
+可能让一对已输出的读段留在合格文件里——决策完成前不输出任何 FASTQ。
+
+### 运行
+
+```bash
+pip install duckdb
+python3 tests_pefastq.py               # 验收测试（34 项）
+python3 main_pefastq.py demo           # examples/pefastq 小样本：每条读段的实际去向 + 参考程序核对
+python3 main_pefastq.py run --manifest examples/pefastq/manifest.csv \
+       --out out/ --min-qual 20 --min-len 8 [--db x.duckdb] [--memory-limit 1GB]
+python3 main_pefastq.py where --db out/pefastq.duckdb --sample DEMO1 --name readC
+python3 main_pefastq.py bigtest        # 20 万对双端远距离到达大样本 + 截断 gzip 演示
+```
+
+`run` 的输出（`--out` 目录）：
+
+- `{sample}_R1.fastq` / `{sample}_R2.fastq`：每个样本两个文件，头部为
+  `规范化名字/1`、`/2`，按名字的 UTF-8 字节序排列，逐条严格对应；
+- `rejected.csv`（拒收明细：source_id、记录序号、起始行、错误、原始头部）、
+  `conflict.csv`（冲突键每端的不同内容与来源）、`duplicates.csv`
+  （重传合并明细与全部来源）、`orphans.csv`、`filtered.csv`
+  （清洗前后长度与过短的端）、`key_states.csv`（每个键的唯一终态）；
+- `stats.csv` / `stats.txt`：清洗前后的读段/碱基统计（全局与每样本）。
+- 整理库（默认 `<out>/pefastq.duckdb`）保留全部明细，`where` 入口可查看
+  某样本的终态分布或某条读段的去向（含落在输出文件的第几对/哪几行）。
+
+任何源未完整读完（截断的四行记录、gzip 解压错误、文件缺失）**整次运行
+失败**，退出码 2，不报告整理成功；已收集的诊断（sources 状态、已校验
+记录）保留在库中。
+
+### 统计口径（对账）
+
+- `records_total` = 所有源读到的物理记录总数；`records_valid` +
+  `records_invalid` = `records_total`。非法记录只计入 `records_invalid`
+  与 `rejected.csv`，不进入任何序列/碱基统计（其规范化序列不可得）。
+- `records_valid` = `distinct_ends` + `merged_copies`：同一
+  （样本, 读段名, 端）内容完全相同的多份拷贝合并为一条，第一份之外计入
+  `merged_copies`。
+- `keys_total` = 五种终态之和（每个键恰好一种终态）。
+- 清洗统计只覆盖两端均唯一合法的键（`clean_pairs` = paired + filtered），
+  每端按合并后的一条计，重传拷贝不重复计读段或碱基：
+  `reads_before` = 2 × clean_pairs；`bases_before` = 这些键两端清洗前
+  长度之和；`reads_after` = 2 × paired；`bases_after` = 合格输出中的碱基
+  总数（与输出文件逐条核对相等）；`bases_trimmed` = 合格键被删去的 3' 端
+  碱基总数。`filtered` 键计入 before、不计入 after；
+  orphan/conflict/rejected 键不进入清洗统计。
+
+### 内存与顺序保证
+
+暂存、分组、连接、排序都在 DuckDB 中进行（`--memory-limit` 控制执行内存，
+超出溢写临时目录）；校验结果批量（默认 2 万条）写盘后经 COPY 入库；导出
+按键集分页（每页默认 2 万对）。待配对记录从不进入随输入增长的 Python
+字典。`bigtest` 在 256MB 配置下整理 20 万对（R1 全部正序分片、R2 反序
+分片），进程峰值约 335MB，输出经独立参考程序逐对核对一致。
+
+### 验证方法（避免自证）
+
+`bitemp/pefastq/refcheck.py` 是独立的小规模内存参考程序：不调用生产管线
+的任何解析/配对/清洗函数，按文档约定的语义独立重写，逐对核对输出文件
+内容（字节级）、每个键的分类与统计口径。`tests_pefastq.py`（34 项）覆盖：
+清单校验、头部格式、四行严格解析（质量串以 @/+ 开头、不按 @ 猜测恢复）、
+截断记录与截断 gzip 整次失败且保留诊断、乱序配对与顺序无关（分片排列/
+记录顺序置换后输出字节一致）、重传合并、清洗后会相同仍记冲突、跨样本
+同名、缺端、非法记录拒收、3' 端清洗边界（含 SQL 清洗与 Python 参考在
+随机质量串上逐条等价）、UTF-8 字节序与逐条对应、统计对账方程、where
+入口、重跑重置。`bigtest` 另演示截断 gzip 被明确报错（退出码 2）。
+
+### 目录（`bitemp/pefastq/`）
+
+```
+model.py      头部解析、记录校验、3' 端清洗（纯函数层）
+fastqio.py    严格四行分块读取（普通/gzip），源不完整即 SourceFailure
+manifest.py   清单装载与校验（source_id 唯一、相对路径按清单位置解析）
+store.py      DuckDB 表结构
+pipeline.py   三阶段管线：暂存 -> 配对决策 -> 清洗导出；where 去向查询
+refcheck.py   独立内存参考程序（不调用生产函数）
+datagen.py    小样本 / 双端远距离到达大样本 / 截断 gzip 生成器
+main_pefastq.py  入口：run / where / demo / bigtest
+tests_pefastq.py 34 项验收测试
+examples/pefastq/ 小样本（11 个键覆盖全部约定情形）
+```
+
 
 ## 测量数据处理与一阶不确定度传播（`bitemp.metrology`）
 

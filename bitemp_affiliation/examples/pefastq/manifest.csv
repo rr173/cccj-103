@@ -1,0 +1,6 @@
+source_id,sample,mate,path
+d1,DEMO1,1,shards/d1_r1.fq
+d2,DEMO1,1,shards/d2_r1.fq.gz
+d3,DEMO1,2,shards/d3_r2.fq
+d4,DEMO1,2,shards/d4_r2.fq.gz
+d5,DEMO2,1,shards/d5_demo2_r1.fq
