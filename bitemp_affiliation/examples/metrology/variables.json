@@ -1,0 +1,11 @@
+{
+  "variables": [
+    {"name": "L1", "dimension": "length"},
+    {"name": "L2", "dimension": "length"},
+    {"name": "L3", "dimension": "length"},
+    {"name": "T1", "dimension": "temperature"},
+    {"name": "T2", "dimension": "temperature"},
+    {"name": "m1", "dimension": "mass"},
+    {"name": "t1", "dimension": "time"}
+  ]
+}

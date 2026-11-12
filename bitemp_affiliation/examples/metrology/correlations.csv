@@ -1,0 +1,10 @@
+specimen,left,right,rho
+S1,L1,L2,0.5
+S6,L1,L2,1
+S7,L1,L2,0.9
+S7,L1,L3,0.9
+S7,L2,L3,-0.9
+S11,L1,L2,1
+S11,L2,L1,1
+S12,L1,L2,0.3
+S12,L2,L1,0.4

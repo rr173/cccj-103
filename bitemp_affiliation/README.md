@@ -1,4 +1,115 @@
-# 研究机构组织归属 · 双时态维表
+# 科研数据工具集（Python + DuckDB）
+
+本仓库包含三项能力：**研究机构组织归属双时态维表**（`bitemp`）、
+**经费分摊管线**（`bitemp.alloc`，含报表主次抑制）、
+**测量数据处理与一阶不确定度传播**（`bitemp.metrology`，新增）。
+
+## 测量数据处理与一阶不确定度传播（`bitemp.metrology`）
+
+实验室把仪器读数交给数据中心后，分析人员要从长度、质量、温度等原始量计算
+派生指标。本模块把不同单位的观测整理进 DuckDB，按公式计算指标值与**一阶
+合成标准不确定度**，并解释结果受哪些原始量影响。它正确处理两件容易被
+“每步误差各自平方相加”搞错的事：同一原始读数被多次使用（导数必须先合并），
+以及两台仪器误差相关（协方差矩阵整体进入传播）。
+
+### 输入（一个目录，四个文件）
+
+```text
+variables.json    {"variables": [{"name": "L1", "dimension": "length"}, ...]}
+                  dimension ∈ length | mass | time | temperature | dimensionless
+measurements.csv  specimen,variable,value,unit,u     u 与 value 同单位（标准不确定度）
+correlations.csv  specimen,left,right,rho            原始变量间相关系数
+formulas.json     {"indicators": [{"name": "Lsum", "expression": "L1 + L2", "unit": "m"}, ...]}
+```
+
+表达式允许：括号、数值常量、`+ - * /`、一元正负号、整数次幂（`x ** 2`、
+`x ^ -1`，指数必须是有符号整数字面量）、`sqrt(x)`；其余语法（含任何其它
+函数调用）明确拒绝，不使用 eval。指标可以引用原始变量或其它指标。
+
+### 数学约定
+
+| 约定 | 实现 |
+|---|---|
+| 内部坐标 | 一律在 SI 基本单位（m, s, kg, K）下计算；显示单位只换算输出的值与 u，不改变计算依据 |
+| 单位变换 | 仿射：value_si = scale·value + offset；**u 只乘 scale，永不加 offset** |
+| degC | 绝对摄氏温度：值 +273.15 转 K，u 不变；显示单位 degC 把指标当绝对温度处理（温差指标请用 K 显示） |
+| 量纲 | 4 维 Fraction 指数向量 (L, M, T, Θ)；加减要求同量纲，乘除/幂/sqrt 相应组合；常量无量纲；sqrt 得分数次量纲 |
+| 传播公式 | u(f)² = g C gᵀ；g 是 f 对每个**原始量**的偏导（前向自动微分，非数值差分），C = D R D 由 u 与 rho 合成 |
+| 中间指标 | 引用中间指标时代入其对原始量的梯度；中间指标从不被当成独立新测量；同一原始量沿多条路径出现时导数在稀疏梯度字典中合并（故 `x - x` 的 u 精确为 0） |
+| 缺失相关 | 未给出的非对角项按 0（本程序约定，随输出说明），对角线恒为 1 |
+| 重复相关项 | 同对（含反向）rho 完全一致时合并，不一致拒收该 specimen |
+| 半正定 | 整体检查最小特征值 ≥ -1e-10；落在 [-1e-10, 0) 的负特征值按 0 修正（截断重构）并在 specimen_notes 注明，不静默改出正定矩阵；更低则拒收该 specimen |
+| 方差分解 | 每个 ok 指标给出梯度、对角贡献 g_i²C_ii 与各变量对两倍交叉贡献 2g_iC_ijg_j（可负，保留），相加恰为合成方差 |
+| 负方差容差 | var < 0 且 \|var\| ≤ 1e-12 × Σ\|各方差贡献\| 时按 0 处理并注明；明显为负记 error，绝不取绝对值开根号 |
+| 求值域 | 缺读数、除数 0、sqrt 参数 ≤ 0（含 0，一阶导数不存在）、0 的负整数次幂 → 仅依赖它的指标 unavailable，给出原因与依赖链，不用 0 补值 |
+| 舍入 | 除最终展示外不舍入；库中与导出均为完整双精度 |
+
+### 误差分层
+
+- **配置错误**（variables.json / formulas.json）：未知量纲、重名、表达式
+  语法/量纲非法、引用不存在的名字、指标循环依赖、显示单位与推导量纲不符。
+  全部汇总后在读数计算前抛出（`ConfigFailure`），可定位到文件与行号。
+- **逐 specimen 拒收**：重复读数、未知变量、单位与量纲不兼容、value/u 非有限、
+  u 为负、相关项非法或矩阵非半正定。列全该 specimen 的拒收原因
+  （带 measurements.csv / correlations.csv 行号），其余 specimen 照常处理。
+- **公式局部失败**：缺读数或求值域问题只让依赖它的指标 unavailable，
+  附原因与依赖链（如 `Lagain -> Lsum -> L2`）；不相关指标不受影响。
+
+### 适用范围与限制
+
+一阶（线性化）不确定度传播：在测值附近用一阶泰勒近似，适用于不确定度
+相对较小、模型在该邻域内接近线性的场合（GUM 方法的常规适用域）。
+强非线性、明显非正态或需要高阶矩的情形不在本程序范围内；sqrt 在 0 点、
+除法在 0 点的一阶导数不存在，按不支持的求导边界处理（指标 unavailable）。
+相关系数视为精确已知；本程序不估计 rho 自身的不确定度。
+
+### 运行
+
+```bash
+pip install duckdb
+python3 tests_metrology.py               # 验收测试（21 项）
+python3 main_metrology.py demo           # examples/metrology 手工可算材料全流程
+python3 main_metrology.py run --dir examples/metrology --db metrology.duckdb
+python3 main_metrology.py explain --db metrology.duckdb --specimen S1 --indicator Lsum
+python3 main_metrology.py export --db metrology.duckdb --out out/
+```
+
+`run` 会重建库中全部 metrology 明细表；之后可从磁盘重新打开库用
+`explain`/`export` 查看已得到的明细。导出含 results.csv（值/u/可用状态/
+原因/依赖链）、gradients.csv、contributions.csv、specimen_status.csv、
+exceptions.json（拒收与失败明细，可追到输入行）、conventions.txt（数学约定）。
+
+### 手工可算材料（`examples/metrology/`）
+
+| 标本 | 演示点 | 手算结果 |
+|---|---|---|
+| S1 | 厘米/毫米换米、摄氏换开尔文、rho=0.5 的和与差、中间指标复用 | Lsum=2.3±√7.6e-5 m；Ldiff=0.7±√2.8e-5 m；Lagain=3.0±0.012 m；energy=11.25±0.135 J |
+| S6 | 完全相关等精度测量：相减 u=0，相加 u=1 | Ldiff=0.1±0；Lsum=1.9±1 |
+| S7 | 每对 rho≤0.9 但整体非半正定（λ_min=-0.8） | 整标本拒收 |
+| S8 | 缺 L2：Lsum 等 unavailable，L1_m/T1_K 正常 | 依赖链可追 |
+| S9 | L2=0：Lratio 除零、Lgeo 处于 sqrt 边界 | 仅二者 unavailable |
+| S10 | L1=-1：Lgeo 的 sqrt 参数为负 | 仅 Lgeo unavailable |
+| S11 | 零不确定度 + 奇异半正定矩阵（rho=1）+ 一致反向重复项合并 | 正常计算，u=0 |
+| S12 | 反向重复项 rho 不一致（0.3 vs 0.4） | 整标本拒收，含行号 |
+| S13 | 长度变量配秒单位 | 整标本拒收，含行号 |
+
+另有 `Lself = L1 - L1` 演示同一原始量导数合并后 u 精确为 0；
+`Lsum` 与 `Lsum_cm` 演示显示单位不改变 SI 计算依据。
+
+### 目录（`bitemp/metrology/`）
+
+```
+jsonpos.py   带行号的 JSON 解析（定位配置错误，不用 eval）
+units.py     量纲向量、单位注册表、显示单位解析（degC 仿射偏移）
+expr.py      表达式词法/语法、量纲推导、前向自动微分
+correl.py    相关矩阵装配、Jacobi 特征值、半正定校验与容差修正
+inputs.py    目录装载：配置错误汇总；数据行保留文件与行号
+compute.py   逐 specimen 校验与计算：方差分解、数值容差
+store.py     DuckDB 表结构
+service.py   高层入口：run / explain / export
+```
+
+## 研究机构组织归属 · 双时态维表
 
 Python + DuckDB 实现。研究者的归属会**迟报**、也会被**追溯更正**；分析人员既能问
 “在某日实际属于哪里”（`effective_at`），也能问“截至上次月结，我们当时认为属于哪里”

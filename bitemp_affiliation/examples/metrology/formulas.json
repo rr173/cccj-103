@@ -1,0 +1,16 @@
+{
+  "indicators": [
+    {"name": "L1_m",    "expression": "L1",                 "unit": "m"},
+    {"name": "T1_K",    "expression": "T1",                 "unit": "K"},
+    {"name": "Tavg_C",  "expression": "(T1 + T2) / 2",      "unit": "degC"},
+    {"name": "Lsum",    "expression": "L1 + L2",            "unit": "m"},
+    {"name": "Lsum_cm", "expression": "L1 + L2",            "unit": "cm"},
+    {"name": "Ldiff",   "expression": "L1 - L2",            "unit": "m"},
+    {"name": "Lagain",  "expression": "Lsum + Ldiff",       "unit": "m"},
+    {"name": "Lself",   "expression": "L1 - L1",            "unit": "m"},
+    {"name": "Lratio",  "expression": "L1 / L2",            "unit": "1"},
+    {"name": "Lgeo",    "expression": "sqrt(L1 * L2)",      "unit": "m"},
+    {"name": "speed",   "expression": "L1 / t1",            "unit": "m/s"},
+    {"name": "energy",  "expression": "m1 * speed ** 2 / 2", "unit": "kg*m^2/s^2"}
+  ]
+}
