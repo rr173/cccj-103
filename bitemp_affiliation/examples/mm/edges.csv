@@ -1,0 +1,12 @@
+edge_id,from_node,to_node
+E_A,N0,N1
+E_P,N10,N11
+E_J,N1,NJ1
+E_ISO,NI1,NI2
+E_R1,N1,NR1
+E_R2,NR1,NR2
+E_R3,NR2,N0
+E_H1,N2,NX
+E_H2,NX,N3
+E_L1,N2,NY
+E_L2,NY,N3
