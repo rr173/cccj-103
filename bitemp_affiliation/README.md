@@ -1,10 +1,137 @@
 # 科研数据工具集（Python + DuckDB）
 
-本仓库包含五项能力：**研究机构组织归属双时态维表**（`bitemp`）、
+本仓库包含六项能力：**研究机构组织归属双时态维表**（`bitemp`）、
 **经费分摊管线**（`bitemp.alloc`，含报表主次抑制）、
 **测量数据处理与一阶不确定度传播**（`bitemp.metrology`）、
 **双端 FASTQ 读段整理管线**（`bitemp.pefastq`）、
-**离线地图匹配**（`bitemp.mm`，新增）。
+**离线地图匹配**（`bitemp.mm`）、
+**离线作业账本**（`bitemp.ledger`，新增）。
+
+## 离线作业账本（`bitemp.ledger`）
+
+科研计算集群会抢占长作业：一个逻辑 job 可能被调度器启动多次 attempt，
+中途存检查点、换节点恢复，最后才成功或失败。日志若只按任务名看最终状态，
+就无法回答一次分析跑了多久、用了多少 CPU/内存，也分不清重试消耗与成功
+运行的消耗。本能力把**调度器事件、节点资源采样、任务依赖**三类离线材料
+导入本地 DuckDB，重建可追查的执行过程并做资源核算。全程离线、无网页，
+只读写本地 JSONL/CSV 与本地 DuckDB，保留仓库既有命令入口不变。
+
+### 输入（三份材料）
+
+- `events.jsonl`：每行一个 JSON 事件，字段
+  `event_id, job_id, attempt_id, event_type, at, node, checkpoint_id, retry_of`；
+  类型为 `submitted / started / checkpoint_saved / preempted / resumed /
+  succeeded / failed`。`at` 是**含时区偏移**的 ISO 8601，导入后统一换算到
+  零时区（内部以 epoch 秒存储，展示为 `…+00:00`）。`event_id` 全局唯一。
+- `samples.csv`：`node, boot_id, sample_from, sample_to, cpu_cores,
+  peak_rss_bytes`。`[sample_from, sample_to)` 是节点上的**半开**采样窗，
+  数值列是窗内平均核心数与峰值 RSS；窗必须正长，数值有限且非负。
+- `dependencies.csv`：`parent_job, child_job`，必须构成无环图，引用的
+  job 都要在事件中出现。
+
+### 状态规则（生命周期判定）
+
+按 `(at, event_id 的 UTF-8 字节序)` 排序后，对每个逻辑 job 独立跑状态机：
+
+- 合法过程：`submitted` 后 `started`；运行中可 `checkpoint_saved` 再
+  `preempted`，随后 `resumed` **必须指回该 attempt 最新保存的
+  checkpoint_id**；也可由运行态直接 `succeeded/failed`。
+- 同一时刻的事件按 `event_id` 的 UTF-8 字节序定先后；若该顺序产生不可能
+  的迁移，把所属 **job 标成 `invalid`** 并在 `job_issues` 列出冲突事件，
+  原始事件全部保留在 `raw_events` 供排查，**同批其他 job 照常核算**。
+- 重试会创建另一个 attempt，并以 `retry_of` 指回同 job 中更早、处于
+  failed/preempted 的尝试；`attempt_id` 不得跨 job 复用。
+- 终态：只有 `submitted` 的 job 为 `queued`；日志在运行途中结束为
+  `incomplete`（不猜终态）；某次失败后后续尝试仍可让 job 成功。
+- 终态之后再出现事件、恢复引用旧检查点、同 job 运行区间相交等均隔离为
+  invalid。抢占后的空档不计运行时间。
+
+### 时间与资源单位、缺测口径
+
+- 时间一律为**秒**（零时区 epoch）。运行秒数 = 各运行片段
+  `[started/resumed, preempted/succeeded/failed)` 的半开区间长度之和；
+  开放片段截到该 attempt 最后一个观测事件。
+- 采样只统计与 attempt **已观测运行时段的交集**，窗被起止时刻按相交时长
+  截断：`CPU core-seconds = Σ cpu_cores × 相交秒`，
+  `RSS byte-seconds = Σ peak_rss_bytes × 相交秒`，峰值内存取实际覆盖到该
+  attempt 的窗中最大 `peak_rss_bytes`。
+- 同一 `node/boot_id` 的窗不得相交（相交为致命错误，整次导入放弃）；
+  **不同 boot_id 的窗可重叠**（节点重启后的两次观测会话），重叠时刻按
+  `boot_id` 的 UTF-8 字节序最小者记账，被让位的窗仍留在 `raw_samples`。
+- 未被任何窗覆盖的运行时间进 `missing_intervals`，**标为缺测，绝不补零或
+  向前沿用**；`coverage_ratio = 已覆盖秒 / 运行秒`。
+
+### 重试成本不隐藏、依赖瓶颈与队列总账
+
+- 每个 job 与 attempt 都输出运行秒、CPU、RSS、峰值内存、覆盖比例与缺测
+  时段；`job` 视图同时给**全部 attempt** 与**成功 attempt** 两套合计，
+  重试消耗不会被并进最终结果。
+- 依赖图按逻辑 job 计算，权重 = 该 job 所有 attempt 运行秒数之和，求加权
+  最长依赖路径并输出路径上的 job、各自权重与总运行秒。等权路径按完整
+  `job_id` 序列的 UTF-8 字节序决胜。未终结/invalid/环污染节点不进完整
+  路径，相关线索单独标 `complete=0`；依赖环写入 `dep_issues`。
+- 队列总账按 job 与状态汇总，且每行都能经
+  `queue_summary → attempts → run_segments → accounting_slices →
+  raw_samples` 下钻回具体运行片段与采样窗。
+
+### 版本化与顺序不变性
+
+- 三份材料按与行序无关的规范化内容计算 SHA-256 摘要作为 `version_id`。
+  完全相同的输入再次导入**复用既有版本、不重复累加**；任一事件或采样值
+  改动则产生新版本，**旧版本仍可按其摘要查询**，多版本在同一库内并存。
+- 仅调整输入文件行序，不改变生命周期判定、资源汇总或依赖路径（摘要也
+  相同）。致命错误（坏行、event_id 内容冲突、attempt 跨 job、同 boot 窗
+  相交等）整体回滚，不留半成品版本。
+
+### 内存口径
+
+事件按批流式读入 DuckDB 暂存表，生命周期按 job 分批取数、处理完即释放，
+资源核算只载入与当前片段节点/时段相交的采样窗；整个事件集不会长期驻留
+Python 对象。`bigtest` 会打印导入/核算耗时与进程峰值常驻内存
+（`ru_maxrss`）作为规模证据。
+
+### 命令
+
+```bash
+# 导入三份材料并完成重建与核算（结果写入本地 DuckDB）
+python3 main_ledger.py import --events events.jsonl --samples samples.csv \
+                              --deps dependencies.csv --db ledger.duckdb
+python3 main_ledger.py versions --db ledger.duckdb          # 全部内容版本
+python3 main_ledger.py jobs     --db ledger.duckdb          # 队列总账
+python3 main_ledger.py job      --db ledger.duckdb --job J_PREEMPT
+python3 main_ledger.py explain  --db ledger.duckdb --job J_RETRY \
+                                --attempt rb2 --segment 1   # 汇总下钻到采样窗
+python3 main_ledger.py paths    --db ledger.duckdb          # 最长依赖路径
+python3 main_ledger.py account  --db ledger.duckdb          # 切片重建汇总对账
+python3 main_ledger.py export   --db ledger.duckdb --out-dir ./out  # CSV+JSON
+# 独立参考实现（重写状态机/积分/路径枚举）与手算期望值逐项对账
+python3 main_ledger.py refcheck --db ledger.duckdb \
+                                --events events.jsonl --samples samples.csv \
+                                --deps dependencies.csv
+python3 main_ledger.py demo      # 可手算小数据：乱序/幂等/冲突/隔离全覆盖
+python3 main_ledger.py bigtest   # 大事件流：耗时、峰值内存与抽查
+python3 tests_ledger.py          # 验收测试
+```
+
+### 手工可算材料（`examples/ledger/`）
+
+`demo` 使用的小数据集可完全手算，覆盖：抢占后从最新检查点续跑成功、失败
+后另建 attempt 重试、同一秒事件按字节序排序、重复事件折叠与冲突 ID、
+采样只覆盖运行时段一部分、采样窗被运行起止截断、不同 boot_id 重叠样本、
+错误生命周期只影响自身 job、依赖环、同权路径字节序决胜。`refcheck.py`
+刻意不 import 产品侧的状态机/积分/路径代码，只用标准库逐个 attempt 重算
+运行时长与资源积分，再用 DFS 枚举小图所有简单路径作对照；`verify.py`
+另含一份手算期望值，防止两套实现犯同样的错。
+
+### 目录（`bitemp/ledger/`）
+
+`parser.py`（流式解析与内容摘要）、`lifecycle.py`（状态机）、
+`accounting.py`（窗交切与积分）、`dependencies.py`（图校验与最长路径）、
+`store.py`（DuckDB 多版本表）、`service.py`（导入/核算编排）、
+`queries.py` / `exporters.py`（查询与导出）、`datagen.py` / `biggen.py`
+（小/大数据生成）、`refcheck.py`（独立参考）、`verify.py`（对账与手算
+期望）。依赖 duckdb；若系统未安装，会自动加载仓库 `.vendor/` 内随附的
+wheel 解包目录。
 
 ## 离线地图匹配（`bitemp.mm`）
 
