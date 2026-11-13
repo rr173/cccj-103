@@ -1,0 +1,5 @@
+{"event_id": "a-e1", "job_id": "A", "attempt_id": "a1", "event_type": "submitted", "at": "2026-11-13T00:00:00+00:00", "node": "", "checkpoint_id": "", "retry_of": ""}
+{"event_id": "a-e2", "job_id": "A", "attempt_id": "a1", "event_type": "started", "at": "2026-11-13T00:00:10+00:00", "node": "n1", "checkpoint_id": "", "retry_of": ""}
+{"event_id": "a-e3", "job_id": "A", "attempt_id": "a1", "event_type": "failed", "at": "2026-11-13T00:00:20+00:00", "node": "n1", "checkpoint_id": "", "retry_of": ""}
+{"event_id": "a-e4", "job_id": "A", "attempt_id": "a2", "event_type": "started", "at": "2026-11-13T00:00:30+00:00", "node": "n1", "checkpoint_id": "", "retry_of": "a1"}
+{"event_id": "a-e5", "job_id": "A", "attempt_id": "a2", "event_type": "checkpoint_saved", "at": "2026-11-13T00:00:40+00:00", "node": "n1", "checkpoint_id": "ck1", "retry_of": ""}

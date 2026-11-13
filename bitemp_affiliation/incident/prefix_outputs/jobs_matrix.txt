@@ -1,0 +1,7 @@
+version_id = 811434b0e78f7780c90b399370d6c9270459d126659076ff79d7abf446071c1f
+status       jobs   run_s(all)   run_s(succ)   cpu_s(all)    rss_bs(all)
+failed          2       50.000         0.000        0.000          0.000
+incomplete      1        0.000         0.000        0.000          0.000
+invalid         1        0.000         0.000        0.000          0.000
+queued          2        0.000         0.000        0.000          0.000
+succeeded       8      120.000       110.000        0.000          0.000

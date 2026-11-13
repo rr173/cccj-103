@@ -1,0 +1,259 @@
+### versions (legacy)
+937cac42541c4c9344228ba139670fbc4076050e269dd6ec67b2f15436d0fb5a  2026-11-13T05:38:15.955+00:00  events=5 samples=0 deps=0 (ledger-1)
+b78bde2318dada0575f652e8d21dd3f710e4ee5d4e66a73c8715195b91a57dbf  2026-11-13T05:38:36.258+00:00  events=4 samples=0 deps=1 (ledger-1)
+
+### pre-fix jobs A version
+version_id = 937cac42541c4c9344228ba139670fbc4076050e269dd6ec67b2f15436d0fb5a
+status       jobs   run_s(all)   run_s(succ)   cpu_s(all)    rss_bs(all)
+failed          1       20.000         0.000        0.000          0.000
+
+### pre-fix paths U/D version
+#1 [完整] 总运行 10s  D  权重=['10']
+#2 [不完整] 总运行 10s  U -> D  权重=['0', '10']
+#3 [不完整] 总运行 0s  U  权重=['0']
+
+### audit A (read-only)
+== 维护 只读审计（不写库）：version_id = 937cac42541c4c9344228ba139670fbc4076050e269dd6ec67b2f15436d0fb5a ==
+受影响衍生表：jobs, queue_summary
+  - job A: ('failed', 1, None) -> ('incomplete', 0, None)
+  - queue_summary: [('failed', 1, 20.0, 0.0, 0.0, 0.0, 0.0, 0.0)] -> [('incomplete', 1, 20.0, 0.0, 0.0, 0.0, 0.0, 0.0)]
+重建后的衍生行数：
+  accounting_slices: 2
+  attempts: 2
+  critical_paths: 0
+  dep_issues: 0
+  job_issues: 0
+  jobs: 1
+  missing_intervals: 2
+  queue_summary: 1
+  run_segments: 2
+原始事实（versions/raw_events/raw_samples/raw_deps）未改动；其他版本未受影响
+
+### repair A
+== 维护 全量重建（单事务替换）：version_id = 937cac42541c4c9344228ba139670fbc4076050e269dd6ec67b2f15436d0fb5a ==
+受影响衍生表：jobs, queue_summary
+  - job A: ('failed', 1, None) -> ('incomplete', 0, None)
+  - queue_summary: [('failed', 1, 20.0, 0.0, 0.0, 0.0, 0.0, 0.0)] -> [('incomplete', 1, 20.0, 0.0, 0.0, 0.0, 0.0, 0.0)]
+重建后的衍生行数：
+  accounting_slices: 2
+  attempts: 2
+  critical_paths: 0
+  dep_issues: 0
+  job_issues: 0
+  jobs: 1
+  missing_intervals: 2
+  queue_summary: 1
+  run_segments: 2
+原始事实（versions/raw_events/raw_samples/raw_deps）未改动；其他版本未受影响
+
+### repair A again (idempotent)
+== 维护 全量重建（单事务替换）：version_id = 937cac42541c4c9344228ba139670fbc4076050e269dd6ec67b2f15436d0fb5a ==
+该版本的衍生记录已与原始事实一致，无变化（重复执行不新增行、不累计数值）
+重建后的衍生行数：
+  accounting_slices: 2
+  attempts: 2
+  critical_paths: 0
+  dep_issues: 0
+  job_issues: 0
+  jobs: 1
+  missing_intervals: 2
+  queue_summary: 1
+  run_segments: 2
+原始事实（versions/raw_events/raw_samples/raw_deps）未改动；其他版本未受影响
+
+### repair U/D
+== 维护 全量重建（单事务替换）：version_id = b78bde2318dada0575f652e8d21dd3f710e4ee5d4e66a73c8715195b91a57dbf ==
+受影响衍生表：critical_paths
+  - critical_paths: 3 条 -> 3 条
+重建后的衍生行数：
+  accounting_slices: 1
+  attempts: 2
+  critical_paths: 3
+  dep_issues: 0
+  job_issues: 0
+  jobs: 2
+  missing_intervals: 1
+  queue_summary: 2
+  run_segments: 1
+原始事实（versions/raw_events/raw_samples/raw_deps）未改动；其他版本未受影响
+
+### post-repair jobs (both versions)
+version_id = 937cac42541c4c9344228ba139670fbc4076050e269dd6ec67b2f15436d0fb5a
+status       jobs   run_s(all)   run_s(succ)   cpu_s(all)    rss_bs(all)
+incomplete      1       20.000         0.000        0.000          0.000
+version_id = b78bde2318dada0575f652e8d21dd3f710e4ee5d4e66a73c8715195b91a57dbf
+status       jobs   run_s(all)   run_s(succ)   cpu_s(all)    rss_bs(all)
+queued          1        0.000         0.000        0.000          0.000
+succeeded       1       10.000        10.000        0.000          0.000
+
+### post-repair paths U/D
+#1 [不完整] 总运行 10s  D  权重=['10']
+#2 [不完整] 总运行 10s  U -> D  权重=['0', '10']
+#3 [不完整] 总运行 0s  U  权重=['0']
+
+### post-repair job A detail
+{
+  "version_id": "937cac42541c4c9344228ba139670fbc4076050e269dd6ec67b2f15436d0fb5a",
+  "job": {
+    "job_id": "A",
+    "status": "incomplete",
+    "is_terminal": 0,
+    "success_attempt": null,
+    "issue": null,
+    "conflict_event_ids": null
+  },
+  "issues": [],
+  "attempts": [
+    {
+      "attempt_id": "a1",
+      "seq": 1,
+      "outcome": "failed",
+      "retry_of": "",
+      "run_seconds": 10.0,
+      "covered_seconds": 0.0,
+      "coverage_ratio": 0.0,
+      "cpu_core_seconds": 0.0,
+      "rss_byte_seconds": 0.0,
+      "peak_rss_bytes": null,
+      "segments": [
+        {
+          "segment_id": 1,
+          "node": "n1",
+          "start": "2026-11-13T00:00:10.000+00:00",
+          "end": "2026-11-13T00:00:20.000+00:00",
+          "run_seconds": 10.0,
+          "start_event_id": "a-e2",
+          "end_event_id": "a-e3"
+        }
+      ],
+      "missing_intervals": [
+        {
+          "segment_id": 1,
+          "start": "2026-11-13T00:00:10.000+00:00",
+          "end": "2026-11-13T00:00:20.000+00:00",
+          "seconds": 10.0
+        }
+      ]
+    },
+    {
+      "attempt_id": "a2",
+      "seq": 2,
+      "outcome": "incomplete",
+      "retry_of": "a1",
+      "run_seconds": 10.0,
+      "covered_seconds": 0.0,
+      "coverage_ratio": 0.0,
+      "cpu_core_seconds": 0.0,
+      "rss_byte_seconds": 0.0,
+      "peak_rss_bytes": null,
+      "segments": [
+        {
+          "segment_id": 1,
+          "node": "n1",
+          "start": "2026-11-13T00:00:30.000+00:00",
+          "end": "2026-11-13T00:00:40.000+00:00",
+          "run_seconds": 10.0,
+          "start_event_id": "a-e4",
+          "end_event_id": null
+        }
+      ],
+      "missing_intervals": [
+        {
+          "segment_id": 1,
+          "start": "2026-11-13T00:00:30.000+00:00",
+          "end": "2026-11-13T00:00:40.000+00:00",
+          "seconds": 10.0
+        }
+      ]
+    }
+  ],
+  "costs": {
+    "all_run_seconds": 20.0,
+    "all_cpu_core_seconds": 0.0,
+    "all_rss_byte_seconds": 0.0,
+    "success_run_seconds": 0.0,
+    "success_cpu_core_seconds": 0.0,
+    "success_rss_byte_seconds": 0.0
+  },
+  "raw_events": [
+    {
+      "event_id": "a-e1",
+      "attempt_id": "a1",
+      "event_type": "submitted",
+      "at_utc": "2026-11-13T00:00:00.000+00:00",
+      "node": "",
+      "checkpoint_id": "",
+      "retry_of": "",
+      "source_line": 1
+    },
+    {
+      "event_id": "a-e2",
+      "attempt_id": "a1",
+      "event_type": "started",
+      "at_utc": "2026-11-13T00:00:10.000+00:00",
+      "node": "n1",
+      "checkpoint_id": "",
+      "retry_of": "",
+      "source_line": 2
+    },
+    {
+      "event_id": "a-e3",
+      "attempt_id": "a1",
+      "event_type": "failed",
+      "at_utc": "2026-11-13T00:00:20.000+00:00",
+      "node": "n1",
+      "checkpoint_id": "",
+      "retry_of": "",
+      "source_line": 3
+    },
+    {
+      "event_id": "a-e4",
+      "attempt_id": "a2",
+      "event_type": "started",
+      "at_utc": "2026-11-13T00:00:30.000+00:00",
+      "node": "n1",
+      "checkpoint_id": "",
+      "retry_of": "a1",
+      "source_line": 4
+    },
+    {
+      "event_id": "a-e5",
+      "attempt_id": "a2",
+      "event_type": "checkpoint_saved",
+      "at_utc": "2026-11-13T00:00:40.000+00:00",
+      "node": "n1",
+      "checkpoint_id": "ck1",
+      "retry_of": "",
+      "source_line": 5
+    }
+  ]
+}
+
+### independent ancestor audit (A version, no product reduce/graph code)
+独立祖先核对通过：逐点检查全部前置祖先，未调用产品归约/图函数
+  A: incomplete
+
+### export and cross-surface consistency (A version)
+  accounting_slices.csv: 2 行/份 -> incident/demo/export_a/accounting_slices.csv
+  attempts.csv: 2 行/份 -> incident/demo/export_a/attempts.csv
+  critical_paths.csv: 0 行/份 -> incident/demo/export_a/critical_paths.csv
+  dep_issues.csv: 0 行/份 -> incident/demo/export_a/dep_issues.csv
+  job_issues.csv: 0 行/份 -> incident/demo/export_a/job_issues.csv
+  jobs.csv: 1 行/份 -> incident/demo/export_a/jobs.csv
+  missing_intervals.csv: 2 行/份 -> incident/demo/export_a/missing_intervals.csv
+  queue_summary.csv: 1 行/份 -> incident/demo/export_a/queue_summary.csv
+  run_segments.csv: 2 行/份 -> incident/demo/export_a/run_segments.csv
+  summary.json: 1 行/份 -> incident/demo/export_a/summary.json
+queue job_count = 1 ; jobs.csv rows = 1
+jobs.csv A status = incomplete ; job detail A status = incomplete
+critical_paths api rows = 0 ; csv rows = 0
+summary.json version = 937cac42541c
+
+### independent ancestor audit (legacy matrix after repair)
+独立祖先核对发现问题：
+  - job 状态与独立归约不一致: db={'J_BAD': 'invalid', 'J_BCHILD': 'succeeded', 'J_FF': 'failed', 'J_FFCHILD': 'succeeded', 'J_FP': 'failed', 'J_FS': 'succeeded', 'J_H': 'succeeded', 'J_H2': 'succeeded', 'J_ICHLILD': 'succeeded', 'J_INC': 'incomplete', 'J_P1': 'succeeded', 'J_P2': 'queued', 'J_QCHILD': 'succeeded', 'J_QUEUE': 'queued'} ref={'J_FF': 'failed', 'J_FS': 'succeeded', 'J_FP': 'incomplete', 'J_P1': 'succeeded', 'J_P2': 'queued', 'J_H': 'succeeded', 'J_H2': 'succeeded', 'J_BAD': 'invalid', 'J_BCHILD': 'succeeded', 'J_QUEUE': 'queued', 'J_QCHILD': 'succeeded', 'J_INC': 'incomplete', 'J_ICHLILD': 'succeeded', 'J_FFCHILD': 'succeeded'}
+  - 完整路径 #6 ['J_BCHILD'] 经过祖先未结束的 J_BAD （阻断集合 ['J_BAD', 'J_BCHILD']）
+  - 完整路径 #7 ['J_ICHLILD'] 经过祖先未结束的 J_INC （阻断集合 ['J_ICHLILD', 'J_INC']）
+  - 完整路径 #1 ['J_P1', 'J_H', 'J_H2'] 经过祖先未结束的 J_P2 （阻断集合 ['J_H', 'J_H2', 'J_P2']）
+  - 完整路径 #2 ['J_P1', 'J_H'] 经过祖先未结束的 J_P2 （阻断集合 ['J_H', 'J_H2', 'J_P2']）
+  - 完整路径 #8 ['J_QCHILD'] 经过祖先未结束的 J_QUEUE （阻断集合 ['J_QCHILD', 'J_QUEUE']）

@@ -15,6 +15,8 @@
   python3 main_ledger.py refcheck --db ledger.duckdb \
                                   --events events.jsonl --samples samples.csv \
                                   --deps dependencies.csv
+  python3 main_ledger.py repair   --db ledger.duckdb --version VID [--check]
+                                  # 只按该版本留存事实重算衍生结局与计算链
   python3 main_ledger.py demo [--work-dir D]       # 可手算小数据 + 参考对账
   python3 main_ledger.py bigtest [--work-dir D]    # 大事件流规模证据
 """
@@ -187,6 +189,35 @@ def cmd_refcheck(args) -> int:
             print(f"  - {p}", file=sys.stderr)
         return 1
     print("产品结果与独立参考实现、手算期望值全部一致（容差 1e-9）")
+    return 0
+
+
+def cmd_repair(args) -> int:
+    """按版本维护：只用该版本留存的原始事实重算衍生结局与计算链。"""
+    mode = "只读审计（不写库）" if args.check else "全量重建（单事务替换）"
+    print(f"== 维护 {mode}：version_id = {args.version} ==")
+    try:
+        r = service.repair_version(
+            args.db, args.version, check_only=args.check,
+            fault_after_jobs=args.fault_after_jobs)
+    except KeyError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    except RuntimeError as e:
+        print(f"维护中止，事务已回滚，旧视图完好：{e}", file=sys.stderr)
+        return 3
+    if not r.changes:
+        print("该版本的衍生记录已与原始事实一致，无变化（重复执行不新增行、"
+              "不累计数值）")
+    else:
+        print(f"受影响衍生表：{', '.join(r.tables_changed)}")
+        for note in r.changes:
+            print(f"  - {note}")
+    print("重建后的衍生行数：")
+    for t in sorted(r.new_counts):
+        print(f"  {t}: {r.new_counts[t]}")
+    print("原始事实（versions/raw_events/raw_samples/raw_deps）未改动；"
+          "其他版本未受影响")
     return 0
 
 
@@ -424,6 +455,16 @@ def main() -> int:
     p.add_argument("--deps", required=True)
     p.add_argument("--version", default=None)
     p.set_defaults(fn=cmd_refcheck)
+
+    p = sub.add_parser("repair", help="按版本只利用留存事实重算衍生结局与计算链")
+    p.add_argument("--db", required=True)
+    p.add_argument("--version", required=True,
+                   help="要维护的版本标识（不会顺带更新其他版本）")
+    p.add_argument("--check", action="store_true",
+                   help="只读审计：报告哪些衍生表需要重算，不写库")
+    p.add_argument("--fault-after-jobs", type=int, default=None,
+                   help=argparse.SUPPRESS)  # 供事务回滚测试注入故障
+    p.set_defaults(fn=cmd_repair)
 
     p = sub.add_parser("demo", help="可手算小数据 + 参考对账 + 乱序/幂等/冲突")
     p.add_argument("--work-dir", default=None)

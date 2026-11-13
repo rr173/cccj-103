@@ -1,0 +1,47 @@
+### transaction rollback: inject write failure mid-rebuild on an unmaintained legacy db
+pre-fault A status: failed
+维护中止，事务已回滚，旧视图完好：注入的写入中途故障：已完成 0 个 job，事务必须回滚
+== 维护 全量重建（单事务替换）：version_id = 937cac42541c4c9344228ba139670fbc4076050e269dd6ec67b2f15436d0fb5a ==
+rc=3
+
+### old view after rollback (must still be the complete pre-fault view)
+version_id = 937cac42541c4c9344228ba139670fbc4076050e269dd6ec67b2f15436d0fb5a
+status       jobs   run_s(all)   run_s(succ)   cpu_s(all)    rss_bs(all)
+failed          1       20.000         0.000        0.000          0.000
+
+### rerun maintenance on the same db (now succeeds; no duplication)
+== 维护 全量重建（单事务替换）：version_id = 937cac42541c4c9344228ba139670fbc4076050e269dd6ec67b2f15436d0fb5a ==
+受影响衍生表：jobs, queue_summary
+  - job A: ('failed', 1, None) -> ('incomplete', 0, None)
+  - queue_summary: [('failed', 1, 20.0, 0.0, 0.0, 0.0, 0.0, 0.0)] -> [('incomplete', 1, 20.0, 0.0, 0.0, 0.0, 0.0, 0.0)]
+重建后的衍生行数：
+  accounting_slices: 2
+  attempts: 2
+  critical_paths: 0
+  dep_issues: 0
+  job_issues: 0
+  jobs: 1
+  missing_intervals: 2
+  queue_summary: 1
+  run_segments: 2
+原始事实（versions/raw_events/raw_samples/raw_deps）未改动；其他版本未受影响
+
+### after successful maintenance
+version_id = 937cac42541c4c9344228ba139670fbc4076050e269dd6ec67b2f15436d0fb5a
+status       jobs   run_s(all)   run_s(succ)   cpu_s(all)    rss_bs(all)
+incomplete      1       20.000         0.000        0.000          0.000
+
+### second maintenance (idempotent)
+== 维护 全量重建（单事务替换）：version_id = 937cac42541c4c9344228ba139670fbc4076050e269dd6ec67b2f15436d0fb5a ==
+该版本的衍生记录已与原始事实一致，无变化（重复执行不新增行、不累计数值）
+重建后的衍生行数：
+  accounting_slices: 2
+  attempts: 2
+  critical_paths: 0
+  dep_issues: 0
+  job_issues: 0
+  jobs: 1
+  missing_intervals: 2
+  queue_summary: 1
+  run_segments: 2
+原始事实（versions/raw_events/raw_samples/raw_deps）未改动；其他版本未受影响

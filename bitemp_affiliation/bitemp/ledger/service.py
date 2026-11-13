@@ -1,12 +1,21 @@
-"""导入与核算编排：流式解析 -> 暂存 -> 全局校验 -> 逐 job 重建与核算。
+"""导入与核算编排：流式解析 -> 暂存 -> 全局校验 -> 落原始事实 -> 重建衍生。
 
 内存口径：events.jsonl 按批读入 DuckDB 暂存表，生命周期重建按 job
 分批从库里取事件（每批处理完即释放），资源核算只载入与当前 attempt
 节点/时段相关的采样窗。整个事件集不会长期驻留 Python 对象。
+
+同一套归约同时服务两条路径：
+
+- ``import_ledger``：校验输入后把原始事实（raw_events/raw_samples/
+  raw_deps）与版本登记一并写入，再由 :func:`_derive` 从原始事实重建
+  全部衍生表（jobs/attempts/run_segments/accounting_slices/...）。
+- :func:`repair_version`：对已入库的某个版本，只读取该版本留存的原始
+  事实，重算并原子替换它的衍生记录；版本标识、原始事实、采样积分与
+  执行片段保持前后一致。修复不再依赖源文件，也不走另一套算法。
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -15,13 +24,19 @@ from ._bootstrap import ensure_vendor_duckdb
 from .accounting import account_segment
 from .dependencies import build_graph, longest_paths
 from .lifecycle import reconstruct_job
-from .model import LedgerInputError, RawSample, utc_iso
+from .model import DepEdge, LedgerInputError, RawEvent, RawSample, utc_iso
 from .parser import CanonicalHasher, iter_dependencies, iter_events, iter_samples
 
 ensure_vendor_duckdb()
 
 STAGING_EVENTS = "_stage_events"
 STAGING_SAMPLES = "_stage_samples"
+
+# 衍生表（全部可由 raw_* 重算）；维护命令只覆盖这些表
+DERIVED_TABLES = [
+    "jobs", "attempts", "run_segments", "job_issues", "accounting_slices",
+    "missing_intervals", "dep_issues", "critical_paths", "queue_summary",
+]
 
 
 @dataclass
@@ -38,6 +53,36 @@ class ImportResult:
     fatal_errors: list[str]
     job_issue_count: int
     dep_issue_count: int
+
+
+@dataclass
+class DerivedDigest:
+    """衍生结果的紧凑摘要，用于判断维护前后哪些表实际发生变化。"""
+    jobs: dict[str, tuple] = field(default_factory=dict)
+    attempts: dict[tuple[str, str], tuple] = field(default_factory=dict)
+    critical_paths: list[tuple] = field(default_factory=list)
+    queue_summary: list[tuple] = field(default_factory=list)
+    table_counts: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class RebuildStats:
+    n_jobs: int = 0
+    n_invalid: int = 0
+    n_queued: int = 0
+    n_issues: int = 0
+    dep_issue_count: int = 0
+    digest: DerivedDigest = field(default_factory=DerivedDigest)
+
+
+@dataclass
+class RepairResult:
+    db_path: str
+    version_id: str
+    check_only: bool
+    tables_changed: list[str]
+    changes: list[str]
+    new_counts: dict[str, int]
 
 
 def _create_staging(con) -> None:
@@ -140,33 +185,47 @@ def _global_sample_checks(con) -> list[str]:
     return errors
 
 
-def _folded_events_for_job(con, job_id: str):
-    return con.execute(f"""
+# ------------------------------------------------------- 原始事实读取
+
+def _raw_job_ids(con, version_id: str) -> list[str]:
+    return [r[0] for r in con.execute(
+        "SELECT DISTINCT job_id FROM raw_events WHERE version_id=? "
+        "ORDER BY job_id", [version_id]).fetchall()]
+
+
+def _raw_events_for_job(con, version_id: str, job_id: str):
+    return con.execute("""
         SELECT event_id, job_id, attempt_id, event_type, at_utc, at_epoch,
                node, checkpoint_id, retry_of, MIN(source_line) AS source_line
-        FROM {STAGING_EVENTS}
-        WHERE job_id=?
+        FROM raw_events
+        WHERE version_id=? AND job_id=?
         GROUP BY event_id, job_id, attempt_id, event_type, at_utc, at_epoch,
                  node, checkpoint_id, retry_of
         ORDER BY at_epoch, event_id
-    """, [job_id]).fetchall()
+    """, [version_id, job_id]).fetchall()
 
 
-def _row_to_event(row) -> "object":
-    from .model import RawEvent
+def _raw_deps(con, version_id: str) -> list[DepEdge]:
+    return [DepEdge(p, c, line) for p, c, line in con.execute(
+        "SELECT parent_job, child_job, source_line FROM raw_deps "
+        "WHERE version_id=? ORDER BY source_line", [version_id]).fetchall()]
+
+
+def _row_to_event(row) -> RawEvent:
     (ev_id, job_id, aid, etype, at_utc, at_epoch, node, cp, retry,
      line) = row
     dt = datetime.fromtimestamp(at_epoch, tz=timezone.utc)
     return RawEvent(ev_id, job_id, aid, etype, dt, node, cp, retry, line)
 
 
-def _load_windows_for_node(con, node: str, lo: float, hi: float) -> list[RawSample]:
-    rows = con.execute(f"""
+def _load_windows_for_node(con, version_id: str, node: str,
+                           lo: float, hi: float) -> list[RawSample]:
+    rows = con.execute("""
         SELECT node, boot_id, sample_from, sample_to, from_epoch, to_epoch,
                cpu_cores, peak_rss_bytes, source_line
-        FROM {STAGING_SAMPLES}
-        WHERE node=? AND from_epoch < ? AND to_epoch > ?
-    """, [node, hi, lo]).fetchall()
+        FROM raw_samples
+        WHERE version_id=? AND node=? AND from_epoch < ? AND to_epoch > ?
+    """, [version_id, node, hi, lo]).fetchall()
     out = []
     for (node_, boot, sf, st, fe, te, cpu, rss, line) in rows:
         out.append(RawSample(node_, boot,
@@ -176,8 +235,10 @@ def _load_windows_for_node(con, node: str, lo: float, hi: float) -> list[RawSamp
     return out
 
 
-def _persist_version(con, version_id: str, n_events: int, n_samples: int,
-                     n_deps: int) -> None:
+def _persist_version_and_raw(con, version_id: str, n_events: int,
+                             n_samples: int, n_deps: int,
+                             deps: list[DepEdge]) -> None:
+    """把版本登记与三份原始事实写入库；衍生表由 _derive 重建。"""
     con.execute(
         "INSERT INTO versions VALUES (?,?,?,?,?,?)",
         [version_id, store.SCHEMA_VERSION,
@@ -193,27 +254,343 @@ def _persist_version(con, version_id: str, n_events: int, n_samples: int,
         f"INSERT INTO raw_samples SELECT ?, node, boot_id, sample_from, "
         f"sample_to, from_epoch, to_epoch, cpu_cores, peak_rss_bytes, "
         f"source_line FROM {STAGING_SAMPLES}", [version_id])
+    if deps:
+        con.executemany(
+            "INSERT INTO raw_deps VALUES (?,?,?,?)",
+            [(version_id, d.parent_job, d.child_job, d.source_line)
+             for d in deps])
 
 
-def _job_weights(con, version_id: str) -> tuple[dict, dict]:
-    rows = con.execute("""
-        SELECT job_id, status, SUM(run_seconds)
-        FROM attempts JOIN jobs USING (version_id, job_id)
-        WHERE version_id=? GROUP BY job_id, status
-    """, [version_id]).fetchall()
-    weights: dict[str, float] = {}
-    statuses: dict[str, str] = {}
-    for j, st, secs in rows:
-        weights[j] = weights.get(j, 0.0) + float(secs)
-        statuses[j] = st
-    # 没有任何 attempt 的 job（只有 submitted）权重为 0
-    for (j, st) in con.execute(
-            "SELECT job_id, status FROM jobs WHERE version_id=?",
-            [version_id]).fetchall():
-        statuses.setdefault(j, st)
-        weights.setdefault(j, 0.0)
-    return weights, statuses
+# ------------------------------------------------------- 衍生重建（唯一实现）
 
+def _derive(con, version_id: str, *, write: bool,
+            flush_jobs: int = 200,
+            fail_after_jobs: int | None = None) -> RebuildStats:
+    """从 raw_events / raw_samples / raw_deps 重建该版本的全部衍生表。
+
+    write=True 时按批写入库（调用方负责事务与删除旧行）；write=False
+    时只计算并返回摘要（审计模式），不写任何行。import 与 repair 共用
+    此函数，不另写一套生命周期 / 图算法。
+    """
+    stats = RebuildStats()
+    job_ids = _raw_job_ids(con, version_id)
+    stats.n_jobs = len(job_ids)
+    deps = _raw_deps(con, version_id)
+
+    buf_jobs: list = []
+    buf_issues: list = []
+    buf_segments: list = []
+    buf_slices: list = []
+    buf_missing: list = []
+    buf_attempts: list = []
+    counts = {t: 0 for t in DERIVED_TABLES}
+
+    def flush() -> None:
+        if not write:
+            buf_jobs.clear(); buf_issues.clear(); buf_segments.clear()
+            buf_slices.clear(); buf_missing.clear(); buf_attempts.clear()
+            return
+        if buf_jobs:
+            con.executemany("INSERT INTO jobs VALUES (?,?,?,?,?,?,?)",
+                            buf_jobs)
+            buf_jobs.clear()
+        if buf_issues:
+            con.executemany("INSERT INTO job_issues VALUES (?,?,?,?,?)",
+                            buf_issues)
+            buf_issues.clear()
+        if buf_segments:
+            con.executemany("INSERT INTO run_segments VALUES (?,?,?,?,?,?,?,?,?,?)",
+                            buf_segments)
+            buf_segments.clear()
+        if buf_slices:
+            con.executemany("INSERT INTO accounting_slices "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", buf_slices)
+            buf_slices.clear()
+        if buf_missing:
+            con.executemany("INSERT INTO missing_intervals VALUES (?,?,?,?,?,?,?)",
+                            buf_missing)
+            buf_missing.clear()
+        if buf_attempts:
+            con.executemany("INSERT INTO attempts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            buf_attempts)
+            buf_attempts.clear()
+
+    job_weights: dict[str, float] = {}
+    job_statuses: dict[str, str] = {}
+
+    for jpos, job_id in enumerate(job_ids):
+        if fail_after_jobs is not None and jpos >= fail_after_jobs:
+            raise RuntimeError(
+                f"注入的写入中途故障：已完成 {jpos} 个 job，事务必须回滚")
+        rows = _raw_events_for_job(con, version_id, job_id)
+        events = [_row_to_event(r) for r in rows]
+        recon = reconstruct_job(job_id, events)
+        if recon.status == "invalid":
+            stats.n_invalid += 1
+        if recon.status == "queued":
+            stats.n_queued += 1
+        job_statuses[job_id] = recon.status
+        job_weights[job_id] = 0.0
+        conflict_ids = sorted({eid for _, _, ids in recon.issues for eid in ids})
+        stats.digest.jobs[job_id] = (
+            recon.status, int(recon.status in ("succeeded", "failed")),
+            recon.success_attempt)
+        buf_jobs.append([
+            version_id, job_id, recon.status,
+            int(recon.status in ("succeeded", "failed")),
+            recon.success_attempt,
+            recon.issues[0][1] if recon.issues else None,
+            ",".join(conflict_ids) if conflict_ids else None])
+        counts["jobs"] += 1
+        for code, detail, ids in recon.issues:
+            stats.n_issues += 1
+            buf_issues.append([version_id, job_id, code, detail,
+                               ",".join(sorted(ids))])
+            counts["job_issues"] += 1
+
+        # ---------------- 逐 attempt 资源核算
+        for aid in recon.attempt_order:
+            a = recon.attempts[aid]
+            run_sec = covered = cpu_s = rss_s = 0.0
+            peak: float | None = None
+            for seg in a.segments:
+                observed_end = seg.end_epoch
+                if observed_end is None:
+                    observed_end = max(
+                        e.at.timestamp() for e in events if e.attempt_id == aid)
+                windows = _load_windows_for_node(
+                    con, version_id, seg.node, seg.start_epoch, observed_end)
+                acc = account_segment(seg, observed_end, windows)
+                buf_segments.append([
+                    version_id, job_id, aid, seg.segment_id, seg.node,
+                    seg.start_epoch, observed_end, acc.run_seconds,
+                    seg.start_event_id, seg.end_event_id])
+                counts["run_segments"] += 1
+                for i, sl in enumerate(acc.slices, start=1):
+                    buf_slices.append([
+                        version_id, job_id, aid, seg.segment_id, i,
+                        sl.from_epoch, sl.to_epoch, sl.overlap_seconds,
+                        sl.cpu_cores, sl.peak_rss_bytes, sl.boot_id,
+                        sl.sample_from, sl.sample_to, sl.sample_line,
+                        int(sl.missing)])
+                    counts["accounting_slices"] += 1
+                for mlo, mhi in acc.missing:
+                    buf_missing.append([version_id, job_id, aid,
+                                        seg.segment_id, mlo, mhi, mhi - mlo])
+                    counts["missing_intervals"] += 1
+                run_sec += acc.run_seconds
+                covered += acc.covered_seconds
+                cpu_s += acc.cpu_core_seconds
+                rss_s += acc.rss_byte_seconds
+                if acc.peak_rss_bytes is not None:
+                    peak = acc.peak_rss_bytes if peak is None \
+                        else max(peak, acc.peak_rss_bytes)
+            ratio = covered / run_sec if run_sec > 0 else 0.0
+            outcome = a.outcome()
+            job_weights[job_id] += run_sec
+            stats.digest.attempts[(job_id, aid)] = (
+                outcome, run_sec, covered, cpu_s, rss_s, peak)
+            buf_attempts.append([
+                version_id, job_id, aid, a.seq, outcome,
+                a.retry_of, run_sec, covered, ratio, cpu_s, rss_s, peak])
+            counts["attempts"] += 1
+
+        if (jpos + 1) % flush_jobs == 0:
+            flush()
+    flush()
+
+    # ---------------- 依赖图与最长路径（与 import 同一实现）
+    known = set(job_ids)
+    graph = build_graph(deps, known)
+    for code, detail, ids in graph.dep_issues:
+        if write:
+            con.execute("INSERT INTO dep_issues VALUES (?,?,?,?)",
+                        [version_id, code, detail, ",".join(ids)])
+    counts["dep_issues"] = len(graph.dep_issues)
+    stats.dep_issue_count = len(graph.dep_issues)
+    paths = longest_paths(job_weights, job_statuses, graph)
+    for pr in paths:
+        if write:
+            con.execute("INSERT INTO critical_paths VALUES (?,?,?,?,?,?)",
+                        [version_id, pr.rank, pr.total,
+                         ",".join(pr.job_ids),
+                         ",".join(f"{x:g}" for x in pr.weights),
+                         int(pr.complete)])
+    counts["critical_paths"] = len(paths)
+    stats.digest.critical_paths = [
+        (pr.rank, round(pr.total, 9), tuple(pr.job_ids),
+         tuple(round(x, 9) for x in pr.weights), int(pr.complete))
+        for pr in paths]
+
+    # ---------------- 队列总账（job 级去重计数，JOIN 后不能用 COUNT(*)）
+    if write:
+        q_rows = con.execute("""
+            SELECT j.status, COUNT(DISTINCT j.job_id),
+                   SUM(a.run_seconds),
+                   SUM(CASE WHEN a.outcome='succeeded' THEN a.run_seconds ELSE 0 END),
+                   SUM(a.cpu_core_seconds),
+                   SUM(CASE WHEN a.outcome='succeeded' THEN a.cpu_core_seconds ELSE 0 END),
+                   SUM(a.rss_byte_seconds),
+                   SUM(CASE WHEN a.outcome='succeeded' THEN a.rss_byte_seconds ELSE 0 END)
+            FROM jobs j LEFT JOIN attempts a
+              ON j.version_id=a.version_id AND j.job_id=a.job_id
+            WHERE j.version_id=?
+            GROUP BY j.status ORDER BY j.status
+        """, [version_id]).fetchall()
+        con.executemany("INSERT INTO queue_summary VALUES (?,?,?,?,?,?,?,?,?)",
+                        [(version_id,) + tuple(r) for r in q_rows])
+        counts["queue_summary"] = len(q_rows)
+    else:
+        q_rows = _queue_rows_in_memory(stats)
+        counts["queue_summary"] = len(q_rows)
+    stats.digest.queue_summary = [
+        (r[0], r[1], round(r[2] or 0.0, 9), round(r[3] or 0.0, 9),
+         round(r[4] or 0.0, 9), round(r[5] or 0.0, 9),
+         round(r[6] or 0.0, 9), round(r[7] or 0.0, 9)) for r in q_rows]
+    stats.digest.table_counts = counts
+    return stats
+
+
+def _queue_rows_in_memory(stats: RebuildStats) -> list[tuple]:
+    """审计模式（write=False）下按与 SQL 相同口径在内存中汇总队列总账。
+
+    jobs/attempts 未写入库，故不能再用上面的 INSERT..SELECT；这里用已
+    收集的 job 状态与 attempt 结局/数值做等价的分组求和，仅用于判断
+    queue_summary 是否漂移。
+    """
+    statuses = {j: v[0] for j, v in stats.digest.jobs.items()}
+    acc: dict[str, list] = {
+        st: [0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] for st in set(statuses.values())}
+    for (job, _aid), v in stats.digest.attempts.items():
+        outcome, run, _cov, cpu, rss, _peak = v
+        row = acc[statuses[job]]
+        row[1] += run
+        if outcome == "succeeded":
+            row[2] += run
+            row[4] += cpu
+            row[6] += rss
+        row[3] += cpu
+        row[5] += rss
+    rows = []
+    for st in sorted(acc):
+        n_jobs = sum(1 for s in statuses.values() if s == st)
+        rows.append((st, n_jobs) + tuple(acc[st][1:]))
+    return rows
+
+
+def _read_digest(con, version_id: str) -> DerivedDigest:
+    """读取库中该版本现有的衍生结果（旧视图）。"""
+    d = DerivedDigest()
+    for job, status, term, succ in con.execute(
+            "SELECT job_id, status, is_terminal, success_attempt FROM jobs "
+            "WHERE version_id=?", [version_id]).fetchall():
+        d.jobs[job] = (status, term, succ)
+    for (job, aid, outcome, run, cov, cpu, rss, peak) in con.execute(
+            "SELECT job_id, attempt_id, outcome, run_seconds, covered_seconds, "
+            "cpu_core_seconds, rss_byte_seconds, peak_rss_bytes FROM attempts "
+            "WHERE version_id=?", [version_id]).fetchall():
+        d.attempts[(job, aid)] = (outcome, run, cov, cpu, rss, peak)
+    d.critical_paths = [
+        (rank, round(total, 9), tuple(job_ids.split(",")),
+         tuple(round(x, 9) for x in _weight_tuple(weights)), int(complete))
+        for rank, total, job_ids, weights, complete in con.execute(
+            "SELECT path_rank, total_run_seconds, job_ids, weights, complete "
+            "FROM critical_paths WHERE version_id=? ORDER BY path_rank",
+            [version_id]).fetchall()]
+    d.queue_summary = [
+        (st, n, round(ra or 0.0, 9), round(rs or 0.0, 9),
+         round(ca or 0.0, 9), round(cs or 0.0, 9),
+         round(ba or 0.0, 9), round(bs or 0.0, 9))
+        for st, n, ra, rs, ca, cs, ba, bs in con.execute(
+            "SELECT status, job_count, run_seconds_all, run_seconds_success, "
+            "cpu_core_seconds_all, cpu_core_seconds_success, "
+            "rss_byte_seconds_all, rss_byte_seconds_success "
+            "FROM queue_summary WHERE version_id=? ORDER BY status",
+            [version_id]).fetchall()]
+    for t in DERIVED_TABLES:
+        d.table_counts[t] = con.execute(
+            f"SELECT COUNT(*) FROM {t} WHERE version_id=?",
+            [version_id]).fetchone()[0]
+    return d
+
+
+def _weight_tuple(text: str) -> list[float]:
+    return [float(x) for x in text.split(",")] if text else []
+
+
+def _num_close(a: float, b: float) -> bool:
+    if a is None and b is None:
+        return True
+    if a is None or b is None:
+        return False
+    return abs(a - b) <= 1e-9 * max(1.0, abs(a), abs(b))
+
+
+def _diff_digests(old: DerivedDigest, new: DerivedDigest
+                  ) -> tuple[list[str], list[str]]:
+    """比较旧视图与新算结果，返回 (变化的表清单, 人类可读的变化明细)。"""
+    changed: set[str] = set()
+    notes: list[str] = []
+
+    for job in sorted(set(old.jobs) | set(new.jobs)):
+        o, n = old.jobs.get(job), new.jobs.get(job)
+        if o != n:
+            changed.add("jobs")
+            notes.append(f"job {job}: {o} -> {n}")
+
+    for key in sorted(set(old.attempts) | set(new.attempts)):
+        o, n = old.attempts.get(key), new.attempts.get(key)
+        if o is None or n is None:
+            changed.add("attempts")
+            notes.append(f"attempt {key[0]}/{key[1]}: {o} -> {n}")
+            continue
+        if o[0] != n[0] or not all(
+                _num_close(float(x) if x is not None else None,
+                           float(y) if y is not None else None)
+                for x, y in zip(o[1:], n[1:])):
+            changed.add("attempts")
+            notes.append(f"attempt {key[0]}/{key[1]}: {o} -> {n}")
+
+    if old.critical_paths != new.critical_paths:
+        changed.add("critical_paths")
+        notes.append(f"critical_paths: {len(old.critical_paths)} 条 -> "
+                     f"{len(new.critical_paths)} 条")
+    if _queue_diff(old.queue_summary, new.queue_summary):
+        changed.add("queue_summary")
+        notes.append(f"queue_summary: {old.queue_summary} -> "
+                     f"{new.queue_summary}")
+
+    for t in DERIVED_TABLES:
+        if old.table_counts.get(t) != new.table_counts.get(t):
+            changed.add(t)
+            notes.append(f"{t}: 行数 {old.table_counts.get(t)} -> "
+                         f"{new.table_counts.get(t)}")
+    return sorted(changed), notes
+
+
+def _queue_diff(old: list[tuple], new: list[tuple]) -> bool:
+    if len(old) != len(new):
+        return True
+    old_by = {r[0]: r for r in old}
+    new_by = {r[0]: r for r in new}
+    if set(old_by) != set(new_by):
+        return True
+    for st in old_by:
+        o, n = old_by[st], new_by[st]
+        if o[1] != n[1] or not all(
+                _num_close(float(x or 0.0) if x is not None else 0.0,
+                           float(y or 0.0) if y is not None else 0.0)
+                for x, y in zip(o[2:], n[2:])):
+            return True
+    return False
+
+
+def _delete_derived(con, version_id: str) -> None:
+    for t in DERIVED_TABLES:
+        con.execute(f"DELETE FROM {t} WHERE version_id=?", [version_id])
+
+
+# ------------------------------------------------------- 导入
 
 def import_ledger(db_path: str | Path, events_path: str | Path,
                   samples_path: str | Path, deps_path: str | Path,
@@ -234,11 +611,12 @@ def import_ledger(db_path: str | Path, events_path: str | Path,
             if fatal:
                 raise LedgerInputError(fatal)
 
-            # 折叠后的唯一事件数（暂存表中完全相同的重复到达只算一条）
+            # 折叠后的唯一事件数（暂存表中完全相同的重复到达只算一条）。
+            # 必须按 event_id 去重：一条事件的业务字段相同、仅重复到达时
+            # 只应算一条；上面的冲突检查已保证同 ID 的记录内容一致。
             n_events = con.execute(
-                f"SELECT COUNT(*) FROM (SELECT DISTINCT event_id, job_id, "
-                f"attempt_id, event_type, at_utc, node, checkpoint_id, "
-                f"retry_of FROM {STAGING_EVENTS})").fetchone()[0]
+                f"SELECT COUNT(DISTINCT event_id) FROM {STAGING_EVENTS}"
+            ).fetchone()[0]
             version_id, n_rows = hasher.digest()
             assert n_rows == n_events + n_samples + n_deps
         except Exception:
@@ -259,167 +637,73 @@ def import_ledger(db_path: str | Path, events_path: str | Path,
                     [version_id]).fetchone()[0],
                 fatal_errors=[], job_issue_count=0, dep_issue_count=0)
 
-        # ---------------- 逐 job 生命周期重建（每 job 独立核算）
-        job_ids = [r[0] for r in con.execute(f"""
-            SELECT DISTINCT job_id FROM {STAGING_EVENTS}
-            ORDER BY job_id
-        """).fetchall()]
+        # ---------------- 先落原始事实，再由同一函数重建全部衍生表
         try:
-            n_invalid = n_queued = n_issues = 0
-            # 结果按表攒批、定期 executemany：生命周期仍逐 job 重建，
-            # 常驻 Python 对象只与单批 job 数相关，不随总事件量增长
-            buf_jobs: list = []
-            buf_issues: list = []
-            buf_segments: list = []
-            buf_slices: list = []
-            buf_missing: list = []
-            buf_attempts: list = []
-            FLUSH_JOBS = 200
-
-            def flush() -> None:
-                if buf_jobs:
-                    con.executemany("INSERT INTO jobs VALUES (?,?,?,?,?,?,?)",
-                                    buf_jobs)
-                    buf_jobs.clear()
-                if buf_issues:
-                    con.executemany(
-                        "INSERT INTO job_issues VALUES (?,?,?,?,?)", buf_issues)
-                    buf_issues.clear()
-                if buf_segments:
-                    con.executemany(
-                        "INSERT INTO run_segments VALUES (?,?,?,?,?,?,?,?,?,?)",
-                        buf_segments)
-                    buf_segments.clear()
-                if buf_slices:
-                    con.executemany(
-                        "INSERT INTO accounting_slices "
-                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", buf_slices)
-                    buf_slices.clear()
-                if buf_missing:
-                    con.executemany(
-                        "INSERT INTO missing_intervals VALUES (?,?,?,?,?,?,?)",
-                        buf_missing)
-                    buf_missing.clear()
-                if buf_attempts:
-                    con.executemany(
-                        "INSERT INTO attempts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                        buf_attempts)
-                    buf_attempts.clear()
-
-            for jpos, job_id in enumerate(job_ids):
-                rows = _folded_events_for_job(con, job_id)
-                events = [_row_to_event(r) for r in rows]
-                recon = reconstruct_job(job_id, events)
-                if recon.status == "invalid":
-                    n_invalid += 1
-                if recon.status == "queued":
-                    n_queued += 1
-                conflict_ids = sorted(
-                    {eid for _, _, ids in recon.issues for eid in ids})
-                buf_jobs.append([
-                    version_id, job_id, recon.status,
-                    int(recon.status in ("succeeded", "failed")),
-                    recon.success_attempt,
-                    recon.issues[0][1] if recon.issues else None,
-                    ",".join(conflict_ids) if conflict_ids else None])
-                for code, detail, ids in recon.issues:
-                    n_issues += 1
-                    buf_issues.append(
-                        [version_id, job_id, code, detail,
-                         ",".join(sorted(ids))])
-
-                # ---------------- 逐 attempt 资源核算
-                for aid in recon.attempt_order:
-                    a = recon.attempts[aid]
-                    run_sec = covered = cpu_s = rss_s = 0.0
-                    peak: float | None = None
-                    for seg in a.segments:
-                        # 开放片段：截到该 attempt 最后一个观测事件
-                        observed_end = seg.end_epoch
-                        if observed_end is None:
-                            observed_end = max(
-                                e.at.timestamp() for e in events
-                                if e.attempt_id == aid)
-                        windows = _load_windows_for_node(
-                            con, seg.node, seg.start_epoch, observed_end)
-                        acc = account_segment(seg, observed_end, windows)
-                        buf_segments.append([
-                            version_id, job_id, aid, seg.segment_id, seg.node,
-                            seg.start_epoch, observed_end, acc.run_seconds,
-                            seg.start_event_id, seg.end_event_id])
-                        for i, sl in enumerate(acc.slices, start=1):
-                            buf_slices.append([
-                                version_id, job_id, aid, seg.segment_id, i,
-                                sl.from_epoch, sl.to_epoch, sl.overlap_seconds,
-                                sl.cpu_cores, sl.peak_rss_bytes, sl.boot_id,
-                                sl.sample_from, sl.sample_to, sl.sample_line,
-                                int(sl.missing)])
-                        for mlo, mhi in acc.missing:
-                            buf_missing.append([
-                                version_id, job_id, aid, seg.segment_id,
-                                mlo, mhi, mhi - mlo])
-                        run_sec += acc.run_seconds
-                        covered += acc.covered_seconds
-                        cpu_s += acc.cpu_core_seconds
-                        rss_s += acc.rss_byte_seconds
-                        if acc.peak_rss_bytes is not None:
-                            peak = acc.peak_rss_bytes if peak is None \
-                                else max(peak, acc.peak_rss_bytes)
-                    ratio = covered / run_sec if run_sec > 0 else 0.0
-                    buf_attempts.append([
-                        version_id, job_id, aid, a.seq, a.outcome(),
-                        a.retry_of, run_sec, covered, ratio, cpu_s, rss_s, peak])
-
-                if (jpos + 1) % FLUSH_JOBS == 0:
-                    flush()
-            flush()
-
-            # ---------------- 依赖图与最长路径
-            known = set(job_ids)
-            graph = build_graph(deps, known)
-            for code, detail, ids in graph.dep_issues:
-                con.execute("INSERT INTO dep_issues VALUES (?,?,?,?)",
-                            [version_id, code, detail, ",".join(ids)])
-            weights, statuses = _job_weights(con, version_id)
-            # 仅事件里出现的 job 参与路径；依赖表中引用的未知 job 不在权重表
-            paths = longest_paths(weights, statuses, graph)
-            for pr in paths:
-                con.execute("INSERT INTO critical_paths VALUES (?,?,?,?,?,?)",
-                            [version_id, pr.rank, pr.total,
-                             ",".join(pr.job_ids),
-                             ",".join(f"{x:g}" for x in pr.weights),
-                             int(pr.complete)])
-
-            # ---------------- 队列总账（job 级去重计数，JOIN 后不能用 COUNT(*)）
-            con.execute("""
-                INSERT INTO queue_summary
-                SELECT ?, j.status, COUNT(DISTINCT j.job_id),
-                       SUM(a.run_seconds),
-                       SUM(CASE WHEN a.outcome='succeeded' THEN a.run_seconds ELSE 0 END),
-                       SUM(a.cpu_core_seconds),
-                       SUM(CASE WHEN a.outcome='succeeded' THEN a.cpu_core_seconds ELSE 0 END),
-                       SUM(a.rss_byte_seconds),
-                       SUM(CASE WHEN a.outcome='succeeded' THEN a.rss_byte_seconds ELSE 0 END)
-                FROM jobs j LEFT JOIN attempts a
-                  ON j.version_id=a.version_id AND j.job_id=a.job_id
-                WHERE j.version_id=?
-                GROUP BY j.status
-            """, [version_id, version_id])
-
-            _persist_version(con, version_id, n_events, n_samples, n_deps)
-            if deps:
-                con.executemany(
-                    "INSERT INTO raw_deps VALUES (?,?,?,?)",
-                    [(version_id, d.parent_job, d.child_job, d.source_line)
-                     for d in deps])
+            _persist_version_and_raw(con, version_id, n_events, n_samples,
+                                     n_deps, deps)
+            stats = _derive(con, version_id, write=True)
         except Exception:
             con.rollback()
             raise
         con.commit()
         return ImportResult(
             str(db_path), version_id, False, n_events, n_samples, n_deps,
-            n_jobs=len(job_ids), n_invalid=n_invalid, n_queued=n_queued,
-            fatal_errors=[], job_issue_count=n_issues,
-            dep_issue_count=len(graph.dep_issues))
+            n_jobs=stats.n_jobs, n_invalid=stats.n_invalid,
+            n_queued=stats.n_queued, fatal_errors=[],
+            job_issue_count=stats.n_issues,
+            dep_issue_count=stats.dep_issue_count)
+    finally:
+        con.close()
+
+
+# ------------------------------------------------------- 维护（按版本重算）
+
+def repair_version(db_path: str | Path, version_id: str, *,
+                   check_only: bool = False,
+                   fault_after_jobs: int | None = None) -> RepairResult:
+    """只利用该版本留存的原始事实，重算并替换其全部衍生记录。
+
+    - 只处理显式给出的 version_id；其他版本一行不改。
+    - raw_events / raw_samples / raw_deps / versions 一律不写，版本标识
+      与底层事实保持一致。
+    - 全部替换（DELETE + 重建）在同一事务中完成：中途故障回滚后旧视图
+      仍完整可读；重复执行不会复制条目，也不会累计数值（每次都从原始
+      事实全量重算，而非在原值上累加）。
+    - check_only=True 时只读审计，不开启写事务。
+    """
+    if check_only:
+        con = store.connect_readonly(db_path)
+        try:
+            if not store.version_exists(con, version_id):
+                raise KeyError(f"账本中不存在版本 {version_id}")
+            old = _read_digest(con, version_id)
+            new = _derive(con, version_id, write=False,
+                          fail_after_jobs=fault_after_jobs)
+            changed, notes = _diff_digests(old, new.digest)
+            return RepairResult(str(db_path), version_id, True, changed, notes,
+                                new.digest.table_counts)
+        finally:
+            con.close()
+
+    con = store.connect(db_path)
+    try:
+        store.ensure_schema(con)
+        if not store.version_exists(con, version_id):
+            raise KeyError(f"账本中不存在版本 {version_id}")
+        con.begin()
+        try:
+            # 事务内读取旧视图 -> 删除 -> 全量重算；任何一步失败整体回滚，
+            # 读者看到的要么是完整的旧视图，要么是完整的新视图。
+            old = _read_digest(con, version_id)
+            _delete_derived(con, version_id)
+            new = _derive(con, version_id, write=True,
+                          fail_after_jobs=fault_after_jobs)
+            changed, notes = _diff_digests(old, new.digest)
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
+        return RepairResult(str(db_path), version_id, False, changed, notes,
+                            new.digest.table_counts)
     finally:
         con.close()

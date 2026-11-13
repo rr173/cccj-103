@@ -64,14 +64,19 @@ HAND_EXPECTED = {
                     "missing": [(10.0, 40.0)]}}},
     "J_OMEGA": {"status": "succeeded", "attempts": {
         "j_omegaa": {"run": 30.0, "covered": 0.0, "cpu": 0.0,
-                    "rss": 0.0, "peak": None,
-                    "missing": [(10.0, 40.0)]}}},
+                     "rss": 0.0, "peak": None,
+                     "missing": [(10.0, 40.0)]}}},
+    # J_TAIL 自身成功（10s 全窗覆盖），但前置 J_INCOMPLETE 未结束
+    "J_TAIL": {"status": "succeeded", "attempts": {
+        "ja1": {"run": 10.0, "covered": 10.0, "cpu": 10.0,
+                "rss": 100.0, "peak": 10.0, "missing": []}}},
 }
 
-# 完整最长路径：三条总权 60s，按完整 job_id 字节序
+# 完整最长路径：三条总权 60s，按完整 job_id 字节序。
+# 注意 J_OMEGA 虽有两条已成功父支路，但其前置 J_INCOMPLETE 未结束，
+# 因此任何经过 J_OMEGA 的路径都不能声称完整（J_ALPHA->J_OMEGA 被正确
+# 地从完整集合中排除）；J_TAIL 自身成功但前置未结束，同样不进完整集合。
 HAND_PATHS = [
-    (60.0, ["J_ALPHA", "J_OMEGA"]),
-    (60.0, ["J_BETA", "J_OMEGA"]),
     (60.0, ["J_RETRY", "J_PREEMPT"]),
 ]
 

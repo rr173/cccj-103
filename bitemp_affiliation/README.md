@@ -41,8 +41,12 @@
   原始事件全部保留在 `raw_events` 供排查，**同批其他 job 照常核算**。
 - 重试会创建另一个 attempt，并以 `retry_of` 指回同 job 中更早、处于
   failed/preempted 的尝试；`attempt_id` 不得跨 job 复用。
-- 终态：只有 `submitted` 的 job 为 `queued`；日志在运行途中结束为
-  `incomplete`（不猜终态）；某次失败后后续尝试仍可让 job 成功。
+- 终态：只有 `submitted` 的 job 为 `queued`（排队，不伪造执行结局）；
+  日志在运行途中结束、后继被抢占而没有结局均为 `incomplete`（不猜终态）。
+  **首轮失败不能压过后继仍在执行的事实**：一个失败轮次之后若还有
+  running/checkpoint/preempted/fresh 的后继轮次，job 为 `incomplete`；
+  只有“已失败且没有后续活跃轮次”的 job 才具有 `failed` 终态。后续尝试
+  成功则 job 为 `succeeded`。
 - 终态之后再出现事件、恢复引用旧检查点、同 job 运行区间相交等均隔离为
   invalid。抢占后的空档不计运行时间。
 
@@ -70,6 +74,12 @@
   最长依赖路径并输出路径上的 job、各自权重与总运行秒。等权路径按完整
   `job_id` 序列的 UTF-8 字节序决胜。未终结/invalid/环污染节点不进完整
   路径，相关线索单独标 `complete=0`；依赖环写入 `dep_issues`。
+  **完整性按全部前置祖先的实际结局判定**：一条链只有链上每个节点的所有
+  前置祖先（含自身）都已结束（succeeded，或 failed 且无后续活跃轮次）才算
+  完整。汇合节点两条父支路只有一条结束时，即使最长支路恰好是已结束的
+  那条，汇合处及其后代也不得声称完整；不能用“另起一个单点结果”绕开。
+  排队、未结束、非法或被环污染的祖先都会阻断，阻断沿全部后代传播。祖先
+  状态只影响链的完整标注，**不改写节点自身的成败与权重**。
 - 队列总账按 job 与状态汇总，且每行都能经
   `queue_summary → attempts → run_segments → accounting_slices →
   raw_samples` 下钻回具体运行片段与采样窗。
@@ -104,6 +114,8 @@ python3 main_ledger.py explain  --db ledger.duckdb --job J_RETRY \
 python3 main_ledger.py paths    --db ledger.duckdb          # 最长依赖路径
 python3 main_ledger.py account  --db ledger.duckdb          # 切片重建汇总对账
 python3 main_ledger.py export   --db ledger.duckdb --out-dir ./out  # CSV+JSON
+# 按版本维护：只利用该版本留存的事实重算结局与计算链（--check 只读审计）
+python3 main_ledger.py repair   --db ledger.duckdb --version <vid>
 # 独立参考实现（重写状态机/积分/路径枚举）与手算期望值逐项对账
 python3 main_ledger.py refcheck --db ledger.duckdb \
                                 --events events.jsonl --samples samples.csv \
@@ -111,6 +123,7 @@ python3 main_ledger.py refcheck --db ledger.duckdb \
 python3 main_ledger.py demo      # 可手算小数据：乱序/幂等/冲突/隔离全覆盖
 python3 main_ledger.py bigtest   # 大事件流：耗时、峰值内存与抽查
 python3 tests_ledger.py          # 验收测试
+python3 incident/regression_checks.py   # 事故回归（含旧库维护/回滚演示）
 ```
 
 ### 手工可算材料（`examples/ledger/`）
@@ -127,11 +140,37 @@ python3 tests_ledger.py          # 验收测试
 
 `parser.py`（流式解析与内容摘要）、`lifecycle.py`（状态机）、
 `accounting.py`（窗交切与积分）、`dependencies.py`（图校验与最长路径）、
-`store.py`（DuckDB 多版本表）、`service.py`（导入/核算编排）、
-`queries.py` / `exporters.py`（查询与导出）、`datagen.py` / `biggen.py`
-（小/大数据生成）、`refcheck.py`（独立参考）、`verify.py`（对账与手算
-期望）。依赖 duckdb；若系统未安装，会自动加载仓库 `.vendor/` 内随附的
-wheel 解包目录。
+`store.py`（DuckDB 多版本表）、`service.py`（导入/核算编排，`import` 与
+`repair` 共用同一 `_derive` 重建函数）、`queries.py` / `exporters.py`
+（查询与导出）、`datagen.py` / `biggen.py`（小/大数据生成）、
+`refcheck.py`（独立参考）、`verify.py`（对账与手算期望）。依赖 duckdb；
+若系统未安装，会自动加载仓库 `.vendor/` 内随附的 wheel 解包目录。
+
+### 按版本维护（`repair`）
+
+已入库的版本若因归约/图算法的判断错误而留下了错误的衍生结局，无需找回
+源文件或删库：
+
+- `repair --db DB --version VID` 只读该版本在 `raw_events` / `raw_samples` /
+  `raw_deps` 中留存的事实，用与导入相同的 `_derive` 重建全部衍生表
+  （`jobs` / `attempts` / `run_segments` / `job_issues` /
+  `accounting_slices` / `missing_intervals` / `dep_issues` /
+  `critical_paths` / `queue_summary`），并**原子替换**该版本的行。
+  `versions` 与三份原始事实一律不写，版本标识前后一致；其他版本一行不改。
+- 识别需要重算的衍生表：`--check` 只读审计，把库中现有视图与按新的
+  归约/图算法重算的结果逐项比较，报告 `jobs` / `attempts` /
+  `critical_paths` / `queue_summary` 及行数发生变化的衍生表；无差异则
+  说明该版本已一致。由于 `attempts` 的结局与状态机判定相关，凡是 `jobs`
+  状态变化的版本通常同时需要核对 `attempts` 与 `queue_summary`。
+- 一致性：`raw_events`→`attempts`→`run_segments`→`accounting_slices`→
+  `raw_samples` 的积分与执行片段全部来自同一批原始事实重算；维护后
+  `job` 明细、`jobs` 总账、`paths` 计算链与导出文件保持一致。
+- 事务保护：整个替换在同一事务内完成（先 `DELETE` 该版本的衍生行，再全量
+  重建）。人为制造写入中途故障时事务整体回滚，旧视图仍完整可读；写事务
+  期间 DuckDB 持有库文件排他锁，其他进程拿不到锁会得到明确错误，而不是
+  读到半新半旧的行——读写者看到的始终是某一次完整提交的视图。重复执行
+  每次都从原始事实全量重算（不是增量累加），因此不会复制条目，也不会
+  累计数值。
 
 ## 离线地图匹配（`bitemp.mm`）
 

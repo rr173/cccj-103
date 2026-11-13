@@ -1,0 +1,17 @@
+== 维护 只读审计（不写库）：version_id = 811434b0e78f7780c90b399370d6c9270459d126659076ff79d7abf446071c1f ==
+受影响衍生表：critical_paths, jobs, queue_summary
+  - job J_FP: ('failed', 1, None) -> ('incomplete', 0, None)
+  - critical_paths: 17 条 -> 15 条
+  - queue_summary: [('failed', 2, 50.0, 0.0, 0.0, 0.0, 0.0, 0.0), ('incomplete', 1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), ('invalid', 1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), ('queued', 2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), ('succeeded', 8, 120.0, 110.0, 0.0, 0.0, 0.0, 0.0)] -> [('failed', 1, 20.0, 0.0, 0.0, 0.0, 0.0, 0.0), ('incomplete', 2, 30.0, 0.0, 0.0, 0.0, 0.0, 0.0), ('invalid', 1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), ('queued', 2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), ('succeeded', 8, 120.0, 110.0, 0.0, 0.0, 0.0, 0.0)]
+  - critical_paths: 行数 17 -> 15
+重建后的衍生行数：
+  accounting_slices: 13
+  attempts: 17
+  critical_paths: 15
+  dep_issues: 0
+  job_issues: 1
+  jobs: 14
+  missing_intervals: 13
+  queue_summary: 5
+  run_segments: 14
+原始事实（versions/raw_events/raw_samples/raw_deps）未改动；其他版本未受影响

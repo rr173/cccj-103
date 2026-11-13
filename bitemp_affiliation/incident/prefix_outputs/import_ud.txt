@@ -1,0 +1,5 @@
+== 导入完成：写入新版本 ==
+  version_id = b78bde2318dada0575f652e8d21dd3f710e4ee5d4e66a73c8715195b91a57dbf
+  事件 4（折叠后）/ 采样窗 0 / 依赖边 1
+  逻辑 job 2：invalid 0，queued 1，job 级问题 0 条，依赖问题 0 条
+  账本: incident/db/pre_ud.duckdb

@@ -298,6 +298,15 @@ def reconstruct_job(job_id: str, events: list[RawEvent]) -> JobReconstruction:
                     break
 
     # ---------------------------------------------------------------- 判定
+    # 终态优先级（按“最后一轮”而不是“历史上出现过失败”）：
+    #   1) 任一次尝试成功 -> succeeded（成功是决定性的，后续不再推进状态机）；
+    #   2) 全部尝试都只有 submitted -> queued（尚未执行，不伪造结局）；
+    #   3) 某个失败轮次之后还有尚未结束的后继轮次（running/checkpoint/
+    #      preempted/fresh）-> incomplete（首轮失败不能压过后继仍在执行的事实）；
+    #   4) 全部轮次都已终结（failed 或 succeeded，且无尚未结束的后继）：
+    #      有失败尝试 -> failed，否则 succeeded。
+    # 只有“失败且没有后续活跃轮次”的 job 才具有 failed 终态；preempted
+    # 与日志中途截止一样保留未结束含义。
     if issues:
         status = JOB_INVALID
         success = None
@@ -308,12 +317,22 @@ def reconstruct_job(job_id: str, events: list[RawEvent]) -> JobReconstruction:
                         if attempts[aid].state == ST_SUCCEEDED), None)
         if success is not None:
             status = JOB_SUCCEEDED
-        elif any(a.state == ST_FAILED for a in attempts.values()):
-            status = JOB_FAILED
         elif all(a.state == ST_FRESH for a in attempts.values()):
             status = JOB_QUEUED
         else:
-            status = JOB_INCOMPLETE
+            failed_seqs = [a.seq for a in attempts.values()
+                           if a.state == ST_FAILED]
+            last_failed_seq = max(failed_seqs) if failed_seqs else None
+            # 尚未结束的轮次：running / checkpoint / preempted / fresh
+            later_active = any(
+                attempts[aid].seq > last_failed_seq
+                for aid in attempt_order
+                if attempts[aid].state not in (ST_SUCCEEDED, ST_FAILED)
+            ) if last_failed_seq is not None else False
+            if last_failed_seq is not None and not later_active:
+                status = JOB_FAILED
+            else:
+                status = JOB_INCOMPLETE
     return JobReconstruction(
         job_id=job_id, valid=valid, issues=issues, attempts=attempts,
         attempt_order=attempt_order, status=status, success_attempt=success)

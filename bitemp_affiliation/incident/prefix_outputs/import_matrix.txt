@@ -1,0 +1,5 @@
+== 导入完成：写入新版本 ==
+  version_id = 811434b0e78f7780c90b399370d6c9270459d126659076ff79d7abf446071c1f
+  事件 44（折叠后）/ 采样窗 0 / 依赖边 7
+  逻辑 job 14：invalid 1，queued 2，job 级问题 1 条，依赖问题 0 条
+  账本: incident/db/pre_matrix.duckdb

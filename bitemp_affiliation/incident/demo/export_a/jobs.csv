@@ -1,0 +1,2 @@
+job_id,status,is_terminal,success_attempt,issue,conflict_event_ids
+A,incomplete,0,,,

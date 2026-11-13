@@ -1,0 +1,8 @@
+parent_job,child_job
+J_P1,J_H
+J_P2,J_H
+J_H,J_H2
+J_BAD,J_BCHILD
+J_QUEUE,J_QCHILD
+J_INC,J_ICHLILD
+J_FF,J_FFCHILD

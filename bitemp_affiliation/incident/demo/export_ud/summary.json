@@ -1,0 +1,87 @@
+{
+  "version_id": "b78bde2318dada0575f652e8d21dd3f710e4ee5d4e66a73c8715195b91a57dbf",
+  "queue_summary": {
+    "version_id": "b78bde2318dada0575f652e8d21dd3f710e4ee5d4e66a73c8715195b91a57dbf",
+    "rows": [
+      {
+        "status": "queued",
+        "job_count": 1,
+        "run_seconds_all": 0.0,
+        "run_seconds_success": 0.0,
+        "cpu_core_seconds_all": 0.0,
+        "cpu_core_seconds_success": 0.0,
+        "rss_byte_seconds_all": 0.0,
+        "rss_byte_seconds_success": 0.0
+      },
+      {
+        "status": "succeeded",
+        "job_count": 1,
+        "run_seconds_all": 10.0,
+        "run_seconds_success": 10.0,
+        "cpu_core_seconds_all": 0.0,
+        "cpu_core_seconds_success": 0.0,
+        "rss_byte_seconds_all": 0.0,
+        "rss_byte_seconds_success": 0.0
+      }
+    ]
+  },
+  "critical_paths": {
+    "version_id": "b78bde2318dada0575f652e8d21dd3f710e4ee5d4e66a73c8715195b91a57dbf",
+    "dep_issues": [],
+    "paths": [
+      {
+        "path_rank": 1,
+        "total_run_seconds": 10.0,
+        "job_ids": [
+          "D"
+        ],
+        "weights": [
+          "10"
+        ],
+        "complete": false
+      },
+      {
+        "path_rank": 2,
+        "total_run_seconds": 10.0,
+        "job_ids": [
+          "U",
+          "D"
+        ],
+        "weights": [
+          "0",
+          "10"
+        ],
+        "complete": false
+      },
+      {
+        "path_rank": 3,
+        "total_run_seconds": 0.0,
+        "job_ids": [
+          "U"
+        ],
+        "weights": [
+          "0"
+        ],
+        "complete": false
+      }
+    ]
+  },
+  "versions": [
+    {
+      "version_id": "937cac42541c4c9344228ba139670fbc4076050e269dd6ec67b2f15436d0fb5a",
+      "schema_version": "ledger-1",
+      "created_at": "2026-11-13T05:38:15.955+00:00",
+      "n_events": 5,
+      "n_samples": 0,
+      "n_deps": 0
+    },
+    {
+      "version_id": "b78bde2318dada0575f652e8d21dd3f710e4ee5d4e66a73c8715195b91a57dbf",
+      "schema_version": "ledger-1",
+      "created_at": "2026-11-13T05:38:36.258+00:00",
+      "n_events": 4,
+      "n_samples": 0,
+      "n_deps": 1
+    }
+  ]
+}

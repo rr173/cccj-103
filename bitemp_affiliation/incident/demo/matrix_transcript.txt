@@ -1,0 +1,89 @@
+### legacy matrix paths (before)
+#1 [完整] 总运行 50s  J_P1 -> J_H -> J_H2  权重=['30', '10', '10']
+#2 [完整] 总运行 40s  J_P1 -> J_H  权重=['30', '10']
+#3 [完整] 总运行 30s  J_FF -> J_FFCHILD  权重=['20', '10']
+#4 [完整] 总运行 30s  J_P1  权重=['30']
+#5 [完整] 总运行 20s  J_FF  权重=['20']
+#6 [完整] 总运行 10s  J_BCHILD  权重=['10']
+#7 [完整] 总运行 10s  J_ICHLILD  权重=['10']
+#8 [完整] 总运行 10s  J_QCHILD  权重=['10']
+#9 [不完整] 总运行 20s  J_P2 -> J_H -> J_H2  权重=['0', '10', '10']
+#10 [不完整] 总运行 10s  J_BAD -> J_BCHILD  权重=['0', '10']
+#11 [不完整] 总运行 10s  J_INC -> J_ICHLILD  权重=['0', '10']
+#12 [不完整] 总运行 10s  J_P2 -> J_H  权重=['0', '10']
+#13 [不完整] 总运行 10s  J_QUEUE -> J_QCHILD  权重=['0', '10']
+#14 [不完整] 总运行 0s  J_BAD  权重=['0']
+#15 [不完整] 总运行 0s  J_INC  权重=['0']
+#16 [不完整] 总运行 0s  J_P2  权重=['0']
+#17 [不完整] 总运行 0s  J_QUEUE  权重=['0']
+
+### legacy matrix jobs (before)
+version_id = 811434b0e78f7780c90b399370d6c9270459d126659076ff79d7abf446071c1f
+status       jobs   run_s(all)   run_s(succ)   cpu_s(all)    rss_bs(all)
+failed          2       50.000         0.000        0.000          0.000
+incomplete      1        0.000         0.000        0.000          0.000
+invalid         1        0.000         0.000        0.000          0.000
+queued          2        0.000         0.000        0.000          0.000
+succeeded       8      120.000       110.000        0.000          0.000
+
+### repair legacy matrix
+== 维护 全量重建（单事务替换）：version_id = 811434b0e78f7780c90b399370d6c9270459d126659076ff79d7abf446071c1f ==
+受影响衍生表：critical_paths, jobs, queue_summary
+  - job J_FP: ('failed', 1, None) -> ('incomplete', 0, None)
+  - critical_paths: 17 条 -> 15 条
+  - queue_summary: [('failed', 2, 50.0, 0.0, 0.0, 0.0, 0.0, 0.0), ('incomplete', 1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), ('invalid', 1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), ('queued', 2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), ('succeeded', 8, 120.0, 110.0, 0.0, 0.0, 0.0, 0.0)] -> [('failed', 1, 20.0, 0.0, 0.0, 0.0, 0.0, 0.0), ('incomplete', 2, 30.0, 0.0, 0.0, 0.0, 0.0, 0.0), ('invalid', 1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), ('queued', 2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), ('succeeded', 8, 120.0, 110.0, 0.0, 0.0, 0.0, 0.0)]
+  - critical_paths: 行数 17 -> 15
+重建后的衍生行数：
+  accounting_slices: 13
+  attempts: 17
+  critical_paths: 15
+  dep_issues: 0
+  job_issues: 1
+  jobs: 14
+  missing_intervals: 13
+  queue_summary: 5
+  run_segments: 14
+原始事实（versions/raw_events/raw_samples/raw_deps）未改动；其他版本未受影响
+
+### fixed matrix paths (after)
+#1 [完整] 总运行 30s  J_FF -> J_FFCHILD  权重=['20', '10']
+#2 [完整] 总运行 30s  J_P1  权重=['30']
+#3 [完整] 总运行 20s  J_FF  权重=['20']
+#4 [不完整] 总运行 50s  J_P1 -> J_H -> J_H2  权重=['30', '10', '10']
+#5 [不完整] 总运行 40s  J_P1 -> J_H  权重=['30', '10']
+#6 [不完整] 总运行 10s  J_BAD -> J_BCHILD  权重=['0', '10']
+#7 [不完整] 总运行 10s  J_BCHILD  权重=['10']
+#8 [不完整] 总运行 10s  J_ICHLILD  权重=['10']
+#9 [不完整] 总运行 10s  J_INC -> J_ICHLILD  权重=['0', '10']
+#10 [不完整] 总运行 10s  J_QCHILD  权重=['10']
+#11 [不完整] 总运行 10s  J_QUEUE -> J_QCHILD  权重=['0', '10']
+#12 [不完整] 总运行 0s  J_BAD  权重=['0']
+#13 [不完整] 总运行 0s  J_INC  权重=['0']
+#14 [不完整] 总运行 0s  J_P2  权重=['0']
+#15 [不完整] 总运行 0s  J_QUEUE  权重=['0']
+
+### fixed matrix jobs (after)
+version_id = 811434b0e78f7780c90b399370d6c9270459d126659076ff79d7abf446071c1f
+status       jobs   run_s(all)   run_s(succ)   cpu_s(all)    rss_bs(all)
+failed          1       20.000         0.000        0.000          0.000
+incomplete      2       30.000         0.000        0.000          0.000
+invalid         1        0.000         0.000        0.000          0.000
+queued          2        0.000         0.000        0.000          0.000
+succeeded       8      120.000       110.000        0.000          0.000
+
+### independent ancestor audit (after repair)
+独立祖先核对通过：逐点检查全部前置祖先，未调用产品归约/图函数
+  J_BAD: invalid
+  J_BCHILD: succeeded
+  J_FF: failed
+  J_FFCHILD: succeeded
+  J_FP: incomplete
+  J_FS: succeeded
+  J_H: succeeded
+  J_H2: succeeded
+  J_ICHLILD: succeeded
+  J_INC: incomplete
+  J_P1: succeeded
+  J_P2: queued
+  J_QCHILD: succeeded
+  J_QUEUE: queued

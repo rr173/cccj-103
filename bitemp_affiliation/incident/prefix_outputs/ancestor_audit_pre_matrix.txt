@@ -1,0 +1,9 @@
+独立祖先核对发现问题：
+  - job 状态与独立归约不一致: db={'J_BAD': 'invalid', 'J_BCHILD': 'succeeded', 'J_FF': 'failed', 'J_FFCHILD': 'succeeded', 'J_FP': 'failed', 'J_FS': 'succeeded', 'J_H': 'succeeded', 'J_H2': 'succeeded', 'J_ICHLILD': 'succeeded', 'J_INC': 'incomplete', 'J_P1': 'succeeded', 'J_P2': 'queued', 'J_QCHILD': 'succeeded', 'J_QUEUE': 'queued'} ref={'J_FF': 'failed', 'J_FS': 'succeeded', 'J_FP': 'incomplete', 'J_P1': 'succeeded', 'J_P2': 'queued', 'J_H': 'succeeded', 'J_H2': 'succeeded', 'J_BAD': 'invalid', 'J_BCHILD': 'succeeded', 'J_QUEUE': 'queued', 'J_QCHILD': 'succeeded', 'J_INC': 'incomplete', 'J_ICHLILD': 'succeeded', 'J_FFCHILD': 'succeeded'}
+  - 完整路径 #6 ['J_BCHILD'] 经过祖先未结束的 J_BAD （阻断集合 ['J_BAD', 'J_BCHILD']）
+  - 完整路径 #7 ['J_ICHLILD'] 经过祖先未结束的 J_INC （阻断集合 ['J_ICHLILD', 'J_INC']）
+  - 完整路径 #1 ['J_P1', 'J_H', 'J_H2'] 经过祖先未结束的 J_P2 （阻断集合 ['J_H', 'J_H2', 'J_P2']）
+  - 完整路径 #2 ['J_P1', 'J_H'] 经过祖先未结束的 J_P2 （阻断集合 ['J_H', 'J_H2', 'J_P2']）
+  - 完整路径 #8 ['J_QCHILD'] 经过祖先未结束的 J_QUEUE （阻断集合 ['J_QCHILD', 'J_QUEUE']）
+
+rc= 1

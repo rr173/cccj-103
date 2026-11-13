@@ -236,10 +236,13 @@ def ref_account(jobs: dict, events: list[dict], samples: list[dict]):
 
 def ref_critical_paths(jobs: dict, accounting: dict, deps: list[tuple[str, str]]):
     children: dict[str, list[str]] = {}
+    parents: dict[str, list[str]] = {}
     nodes: set[str] = set()
     for p, c in deps:
         children.setdefault(p, []).append(c)
         children.setdefault(c, [])
+        parents.setdefault(c, []).append(p)
+        parents.setdefault(p, [])
         nodes.update((p, c))
 
     # 权重：一个 job 全部 attempt 运行秒数之和
@@ -289,14 +292,41 @@ def ref_critical_paths(jobs: dict, accounting: dict, deps: list[tuple[str, str]]
     for n in sorted(nodes, key=lambda x: x.encode("utf-8")):
         walk(n, [n], weight[n], frozenset({n}))
 
+    # 完整性口径（独立实现，不调用产品侧依赖图代码）：对路径上的每个
+    # 节点，沿全部父边反向收集它的所有前置祖先（传递闭包），要求每个
+    # 祖先（含节点自身）都处于 ended 终态且不在环污染集合。不能只看
+    # 被选中的父支路——汇合处任一父支路未结束，汇合点及其后代都不完整。
+    def _ancestors(n: str) -> set[str]:
+        seen_a: set[str] = set()
+        frontier = [n]
+        while frontier:
+            cur = frontier.pop()
+            if cur in seen_a:
+                continue
+            seen_a.add(cur)
+            for p in parents.get(cur, []):
+                if p not in seen_a:
+                    frontier.append(p)
+        return seen_a
+
+    def _ended(x: str) -> bool:
+        return x not in tainted and status.get(x) in ("succeeded", "failed")
+
+    def _chain_ended(seq: list[str]) -> bool:
+        if not all(x not in tainted and status.get(x) in
+                   ("succeeded", "failed") for x in seq):
+            return False
+        for x in seq:
+            if not all(_ended(a) for a in _ancestors(x)):
+                return False
+        return True
+
     complete = [(-t, tuple(x.encode("utf-8") for x in p), t, p)
                 for t, p in all_paths
-                if all(x not in tainted and status[x] in
-                       ("succeeded", "failed") for x in p)]
+                if _chain_ended(p)]
     incomplete = [(-t, tuple(x.encode("utf-8") for x in p), t, p)
                   for t, p in all_paths
-                  if not all(x not in tainted and status[x] in
-                             ("succeeded", "failed") for x in p)]
+                  if not _chain_ended(p)]
     complete.sort()
     incomplete.sort()
     return {

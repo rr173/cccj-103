@@ -1,0 +1,2 @@
+status,job_count,run_seconds_all,run_seconds_success,cpu_core_seconds_all,cpu_core_seconds_success,rss_byte_seconds_all,rss_byte_seconds_success
+incomplete,1,20.0,0.0,0.0,0.0,0.0,0.0

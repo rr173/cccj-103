@@ -13,6 +13,8 @@
   J_QUEUED    只有 submitted -> queued
   J_INCOMPLETE 日志在运行途中结束 -> incomplete，不猜终态
   J_ALPHA/J_BETA/J_OMEGA 等权依赖路径，按完整 job_id 字节序决胜
+  J_TAIL      J_INCOMPLETE -> J_TAIL 证明未结束祖先会阻断后代的完整声明；
+              J_TAIL 自身成功仍照常展示，只是其计算链不完整
   J_C1/J_C2/J_C3 依赖环 + 下游污染
   重复事件 e_dup 完全相同地到达两次 -> 折叠
 采样场景：
@@ -107,6 +109,13 @@ def build_events() -> list[dict]:
         _ev("i03", "J_INCOMPLETE", "ia1", "checkpoint_saved", 20, cp="cp-i1"),
     ]
 
+    # J_TAIL：自身成功，但前置 J_INCOMPLETE 尚未结束 -> 计算链不完整
+    ev += [
+        _ev("y01", "J_TAIL", "ja1", "submitted", 0),
+        _ev("y02", "J_TAIL", "ja1", "started", 10, "nY"),
+        _ev("y03", "J_TAIL", "ja1", "succeeded", 20, "nY"),
+    ]
+
     # 三个 10s 短作业 + 两个 30s 作业（依赖决胜用）
     for job, node in [("J_C1", "nC"), ("J_C2", "nC"), ("J_C3", "nC")]:
         ev += [
@@ -154,6 +163,8 @@ def build_samples() -> list[list]:
     ]
     # nA：单窗 [5,45) 被运行 [10,40) 两端截断但全覆盖
     rows.append(_win("nA", "boot-1", 5, 45, 1.0, 10))
+    # nY：J_TAIL 的完整覆盖窗
+    rows.append(_win("nY", "boot-1", 5, 25, 1.0, 10))
     return rows
 
 
@@ -163,6 +174,7 @@ def build_deps() -> list[list]:
         ["J_ALPHA", "J_OMEGA"],            # 30+30=60
         ["J_BETA", "J_OMEGA"],             # 30+30=60（三路等权，字节序决胜）
         ["J_INCOMPLETE", "J_OMEGA"],       # 经未终结节点 -> 不完整路径
+        ["J_INCOMPLETE", "J_TAIL"],        # 未结束的前置阻断后代完整声明
         ["J_C1", "J_C2"],                  # 环
         ["J_C2", "J_C1"],
         ["J_C2", "J_C3"],                  # 环下游污染

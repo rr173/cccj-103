@@ -3,12 +3,18 @@
 权重 = 一个逻辑 job 全部 attempt 的运行秒数之和。等权路径按完整
 job_id 序列的 UTF-8 字节序决胜。未终结/invalid 节点不得混入完整路径，
 依赖它们的结果标注不完整。
+
+完整性口径：一条依赖链声称“完整”，要求链上每个节点的**全部前置祖先**
+都处于已结束的终态（succeeded 或 failed），并且节点自身也处于已结束
+终态。不能只看被选中的最长父支路：汇合节点若有两条父支路，其中一条
+尚未结束，即使最长支路恰好是已结束的那条，汇合处及其后代也不能完整。
+环污染节点、未知 job 同样阻断，且阻断沿全部后代传播。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-# 可参与完整最长路径的 job 状态
+# 已结束的终态：成功，以及失败且没有后续活跃轮次的尝试（由 lifecycle 判定）
 COMPLETE_STATUSES = frozenset({"succeeded", "failed"})
 
 
@@ -113,15 +119,70 @@ class PathResult:
     complete: bool
 
 
+def ancestor_complete(graph: GraphResult, statuses: dict[str, str]
+                      ) -> dict[str, bool]:
+    """逐节点判定“全部前置祖先（含自身）都已结束”。
+
+    直接按全部父边的实际结局求值，不做路径截断：对任一节点，
+    complete[n] = n 已结束且未被环污染 且 每个直接父节点 complete[p]。
+    等价于对全部祖先做命中检查（传递闭包），因为父节点自身的不完整
+    已经包含它自己的祖先状态。DP 依赖 DAG 拓扑序；环上/环下游节点
+    （tainted）一律为 False，不会被“另起一个单点结果”绕开。
+    """
+    # 只沿非污染节点求值；tainted 节点恒为 False
+    order = _topological_order(graph)
+    done: dict[str, bool] = {}
+    for n in order:
+        if n in graph.tainted_nodes:
+            done[n] = False
+            continue
+        own_ok = statuses.get(n) in COMPLETE_STATUSES
+        parents_ok = all(done.get(p, False) for p in graph.parents.get(n, []))
+        done[n] = own_ok and parents_ok
+    # 不在图里的节点（防御性）按自身状态判定
+    for n in graph.nodes:
+        if n not in done:
+            done[n] = (n not in graph.tainted_nodes
+                       and statuses.get(n) in COMPLETE_STATUSES)
+    return done
+
+
+def _topological_order(graph: GraphResult) -> list[str]:
+    """在整张图（含污染节点）上按 UTF-8 字节序做确定性 Kahn 拓扑排序。
+
+    环上节点没有入度归零点，排不进 topo；它们及下游在
+    ancestor_complete 中已被 tainted 直接判 False，不依赖拓扑位次。
+    """
+    indeg = {n: len(graph.parents.get(n, [])) for n in graph.nodes}
+    queue = sorted((n for n, d in indeg.items() if d == 0),
+                   key=lambda x: x.encode("utf-8"))
+    topo: list[str] = []
+    while queue:
+        n = queue.pop(0)
+        topo.append(n)
+        for c in sorted(graph.children.get(n, []), key=lambda x: x.encode("utf-8")):
+            indeg[c] -= 1
+            if indeg[c] == 0:
+                queue.append(c)
+        queue.sort(key=lambda x: x.encode("utf-8"))
+    return topo
+
+
 def longest_paths(weights: dict[str, float], statuses: dict[str, str],
-                  graph: GraphResult, top_k: int = 20) -> list[PathResult]:
+                  graph: GraphResult, top_k: int = 20,
+                  chain_complete: dict[str, bool] | None = None,
+                  ) -> list[PathResult]:
     """在可计算节点上做加权最长路径 DP，等权按 job_id 序列 UTF-8 决胜。
 
     weights: job_id -> 全部 attempt 运行秒数之和（无运行片段的为 0）。
-    完整路径只允许 succeeded/failed 且不在 tainted 集合内的节点；
-    含 queued/running/incomplete/invalid/环污染节点的路径单独以
-    complete=0 给出最长线索。
+    完整路径要求链上每个节点的**全部前置祖先**都已结束
+    （见 ancestor_complete），而不只是被选中的这条父支路。
+    含 queued/running/incomplete/invalid/环污染节点或存在未结束祖先的
+    路径单独以 complete=0 给出最长线索。节点自身的成败仍决定权重与
+    它能否参与完整链，不会被祖先状态改写状态本身。
     """
+    if chain_complete is None:
+        chain_complete = ancestor_complete(graph, statuses)
     usable = {n for n in graph.nodes
               if n in weights and n not in graph.tainted_nodes}
     # 只保留 usable 节点诱导子图的边（DAG，环上节点已被剔除）
@@ -161,7 +222,8 @@ def longest_paths(weights: dict[str, float], statuses: dict[str, str],
     best_incomplete: dict[str, list[tuple[float, list[str]]]] = {}
     for n in topo:
         w = weights[n]
-        node_complete = statuses.get(n) in COMPLETE_STATUSES
+        # 能否作为完整链的成员：自身已结束 + 全部前置祖先已结束 + 未被环污染
+        node_complete = bool(chain_complete.get(n, False))
         cand_c: list[tuple[float, list[str]]] = []
         cand_i: list[tuple[float, list[str]]] = []
         for p in parents[n]:
@@ -175,7 +237,8 @@ def longest_paths(weights: dict[str, float], statuses: dict[str, str],
                 choices_i = [(t + w, seq + [n]) for t, seq in cand_i]
                 best_incomplete[n] = _keep_tied(choices_i)
         else:
-            # 自身不完整：任何经过它的路径都只能进不完整集合
+            # 自身或某个前置祖先未结束：任何经过它的路径都只能进不完整集合
+            # 单点也从“不完整”起步，避免把孤立节点伪装成完整链
             choices_i = [(t + w, seq + [n]) for t, seq in cand_c] \
                 + [(t + w, seq + [n]) for t, seq in cand_i] + [solo]
             best_incomplete[n] = _keep_tied(choices_i)
